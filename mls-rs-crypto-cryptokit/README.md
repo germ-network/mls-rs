@@ -36,19 +36,22 @@ provider tests in `mls-rs-core` for more thorough validation.
 
 ## Build requirements
 
-The Swift bridge requires a toolchain that can build for macOS 26 / iOS 26 targets,
-because `CryptoKit.MLKEM768` (FIPS 203) is only available from those platform
-versions.
+The Swift bridge must be compiled with the Xcode 26 / Swift 6.2 toolchain because
+`CryptoKit.MLKEM768` (FIPS 203) is only present in that SDK.  The package deployment
+targets are iOS 16 / macOS 14; the ML-KEM entry points are individually guarded with
+`@available(iOS 26.0, macOS 26.0, *)` so the library can be linked into apps that
+support older OS versions while only activating ML-KEM at runtime on iOS 26+ / macOS 26+.
 
-| Component | Minimum version |
-|-----------|----------------|
-| Swift toolchain | Swift 6.2 (ships with Xcode 26 beta or later) |
-| macOS deployment target | 26.0 |
-| iOS deployment target | 26.0 |
+| Component | Value |
+|-----------|-------|
+| Swift toolchain (compile-time) | Swift 6.2 / Xcode 26 or later |
+| macOS deployment target | 14.0 |
+| iOS deployment target | 16.0 |
+| ML-KEM runtime availability | macOS 26.0 / iOS 26.0 (`@available`-gated) |
 
 The build script (`build.rs`) invokes `swift build` on `cryptokit-bridge/` at
-compile time.  If the active Xcode / Swift toolchain does not support the macOS
-26 SDK, the build will fail with a deployment-target error.
+compile time.  If the active toolchain does not include the macOS 26 SDK,
+the build will fail because `CryptoKit.MLKEM768` is undefined.
 
 ### Feature flags
 

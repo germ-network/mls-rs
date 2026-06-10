@@ -15,7 +15,7 @@ use crate::kem::KemError;
 // Never deserialise a CryptoKit secret key into the AWS-LC provider or vice versa.
 //
 // Public keys (1184 bytes) and ciphertexts (1088 bytes) are compatible across
-// providers: both use the same ML-KEM-768 wire format (FIPS 203 / draft-mls-pq).
+// providers: both use the standard ML-KEM-768 wire format (FIPS 203).
 const ENC_KEY_SIZE: usize = 1184;
 const DEC_KEY_SIZE: usize = 96;
 const CT_SIZE: usize = 1088;

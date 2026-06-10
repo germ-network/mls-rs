@@ -71,9 +71,9 @@ impl KemType for MlKemKem {
     type Error = AwsLcCryptoError;
 
     fn kem_id(&self) -> u16 {
-        // Private-range KEM IDs matching the corresponding MLS cipher suite values
-        // (draft-mls-pq). These must be consistent with any other provider that
-        // implements the same suites (e.g. mls-rs-crypto-cryptokit).
+        // KEM IDs chosen to equal the MLS cipher suite numbers we assigned for these
+        // variants (private-use range, no IETF assignment). Must stay in sync with
+        // any other provider implementing the same suites (e.g. mls-rs-crypto-cryptokit).
         match self.ml_kem {
             MlKem::MlKem512 => 0xFDEB,
             MlKem::MlKem768 => 0xFDEA,
