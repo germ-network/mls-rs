@@ -12,6 +12,8 @@ license = "Apache-2.0 OR MIT"
 default = ["std"]
 std = ["dep:thiserror", "mls-rs-core/std", "mls-rs-crypto-traits/std"]
 post-quantum = ["dep:mls-rs-crypto-hpke", "mls-rs-core/post-quantum"]
+# macOS-only; enables cross-provider interop tests between this provider and mls-rs-crypto-awslc.
+# Not used in iOS builds or production; opt-in only.
 awslc-interop = ["dep:mls-rs-crypto-awslc", "post-quantum"]
 
 [build-dependencies]
