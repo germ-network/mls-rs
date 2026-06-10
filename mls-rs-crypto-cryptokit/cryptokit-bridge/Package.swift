@@ -5,8 +5,8 @@ import PackageDescription
 let package = Package(
     name: "cryptokit-bridge",
     platforms: [
-        .macOS(.v26),
-        .iOS(.v26),
+        .macOS(.v14),
+        .iOS(.v16),
     ],
     products: [
         .library(name: "cryptokit-bridge", type: .static, targets: ["cryptokit-bridge"]),
