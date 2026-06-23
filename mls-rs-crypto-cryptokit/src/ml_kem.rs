@@ -2,9 +2,10 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use mls_rs_core::crypto::{HpkePublicKey, HpkeSecretKey};
-use mls_rs_crypto_traits::{KemResult, KemType};
+use mls_rs_core::crypto::{CipherSuite, HpkePublicKey, HpkeSecretKey};
+use mls_rs_crypto_traits::{KdfType, KemResult, KemType};
 
+use crate::kdf::Kdf;
 use crate::kem::KemError;
 
 // ML-KEM-768 sizes (CryptoKit representation)
@@ -20,6 +21,9 @@ const ENC_KEY_SIZE: usize = 1184;
 const DEC_KEY_SIZE: usize = 96;
 const CT_SIZE: usize = 1088;
 const SS_SIZE: usize = 32;
+// FIPS 203 ML-KEM-768 key-generation seed (d || z), the input CryptoKit's
+// `seedRepresentation` initializer expects.
+const SEED_SIZE: usize = 64;
 
 extern "C" {
     fn ml_kem_768_generate(
@@ -45,6 +49,15 @@ extern "C" {
         priv_len: u64,
         ss_ptr: *mut u8,
         ss_len: *mut u64,
+    ) -> u64;
+
+    fn ml_kem_768_derive(
+        seed_ptr: *const u8,
+        seed_len: u64,
+        priv_ptr: *mut u8,
+        priv_len: *mut u64,
+        pub_ptr: *mut u8,
+        pub_len: *mut u64,
     ) -> u64;
 }
 
@@ -97,10 +110,45 @@ impl KemType for MlKem768Kem {
 
     async fn generate_deterministic(
         &self,
-        _ikm: &[u8],
+        ikm: &[u8],
     ) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
-        // CryptoKit's MLKEM768 does not expose a seed-based key generation API.
-        Err(KemError::NotSupported)
+        // MLS DeriveKeyPair feeds a `dkp_prk` of the suite KDF's extract size
+        // (HKDF-SHA256 => 32 bytes), but ML-KEM-768 KeyGen needs a 64-byte seed
+        // (FIPS 203 `d || z`). Expand to 64 bytes with HKDF-Expand-SHA256 — the
+        // same transform mls-rs-crypto-awslc applies, so a CryptoKit member and an
+        // AWS-LC member derive identical key pairs from the same path secret.
+        let seed: Vec<u8> = if ikm.len() == SEED_SIZE {
+            ikm.to_vec()
+        } else {
+            let kdf = Kdf::new(CipherSuite::CURVE25519_AES128).ok_or(KemError::NotSupported)?;
+            kdf.expand(ikm, &[], SEED_SIZE)
+                .await
+                .map_err(|_| KemError::CryptoKitError)?
+        };
+
+        let mut priv_buf = vec![0u8; DEC_KEY_SIZE];
+        let mut priv_len = priv_buf.len() as u64;
+        let mut pub_buf = vec![0u8; ENC_KEY_SIZE];
+        let mut pub_len = pub_buf.len() as u64;
+
+        let rv = unsafe {
+            ml_kem_768_derive(
+                seed.as_ptr(),
+                seed.len() as u64,
+                priv_buf.as_mut_ptr(),
+                &mut priv_len,
+                pub_buf.as_mut_ptr(),
+                &mut pub_len,
+            )
+        };
+
+        if rv != 1 {
+            return Err(KemError::CryptoKitError);
+        }
+
+        priv_buf.truncate(priv_len as usize);
+        pub_buf.truncate(pub_len as usize);
+        Ok((priv_buf.into(), pub_buf.into()))
     }
 
     fn public_key_validate(&self, _key: &HpkePublicKey) -> Result<(), Self::Error> {
@@ -165,6 +213,6 @@ impl KemType for MlKem768Kem {
     }
 
     fn seed_length_for_derive(&self) -> usize {
-        0
+        SEED_SIZE
     }
 }

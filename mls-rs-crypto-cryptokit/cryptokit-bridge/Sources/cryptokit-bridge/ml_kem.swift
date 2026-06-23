@@ -22,8 +22,12 @@ public func ml_kem_768_generate(
     return 1
 }
 
-// CryptoKit's MLKEM768 does not expose a seed-based key generation API.
-// Returns 0 (failure) unconditionally.
+// Deterministically derive an ML-KEM-768 key pair from a 64-byte seed
+// (FIPS 203 seedRepresentation, d || z). Used for MLS DeriveKeyPair / TreeKEM
+// path-secret key derivation.
+// seedPtr/seedLen in: 64-byte seed
+// privPtr/privLen out: decapsulation key (96 bytes, integrityCheckedRepresentation)
+// pubPtr/pubLen out: encapsulation key (1184 bytes, rawRepresentation)
 @_cdecl("ml_kem_768_derive")
 @available(iOS 26.0, macOS 26.0, *)
 public func ml_kem_768_derive(
@@ -31,7 +35,11 @@ public func ml_kem_768_derive(
     privPtr: UnsafeMutablePointer<UInt8>, privLen: UnsafeMutablePointer<UInt64>,
     pubPtr: UnsafeMutablePointer<UInt8>, pubLen: UnsafeMutablePointer<UInt64>
 ) -> UInt64 {
-    return 0
+    let seed = dataFromRawParts(ptr: seedPtr, len: seedLen)
+    guard let key = try? MLKEM768.PrivateKey(seedRepresentation: seed, publicKey: nil) else { return 0 }
+    guard copyToOutput(from: key.integrityCheckedRepresentation, ptr: privPtr, lenPtr: privLen) == 1 else { return 0 }
+    guard copyToOutput(from: key.publicKey.rawRepresentation, ptr: pubPtr, lenPtr: pubLen) == 1 else { return 0 }
+    return 1
 }
 
 // Encapsulate to the given encapsulation (public) key.
