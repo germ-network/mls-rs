@@ -420,16 +420,25 @@ fn ml_kem_hpke_seal_open_with_aad() {
 
 #[cfg(feature = "post-quantum")]
 #[test]
-fn ml_kem_kem_derive_returns_not_supported() {
-    use crate::kem::KemError;
+fn ml_kem_kem_derive_is_deterministic_and_usable() {
     use mls_rs_core::crypto::{CipherSuiteProvider, CryptoProvider};
     let provider = CryptoKitMlKemProvider;
     let cs = provider.cipher_suite_provider(CS::ML_KEM_768).unwrap();
-    let err = cs.kem_derive(b"some-ikm").unwrap_err();
-    assert!(matches!(
-        err,
-        CryptoKitError::KemError(KemError::NotSupported)
-    ));
+
+    // Deterministic: the same ikm always yields the same key pair.
+    let (sk1, pk1) = cs.kem_derive(b"some-ikm").unwrap();
+    let (sk2, pk2) = cs.kem_derive(b"some-ikm").unwrap();
+    assert_eq!(pk1, pk2);
+    assert_eq!(sk1, sk2);
+
+    // A different ikm yields a different key pair.
+    let (_, pk3) = cs.kem_derive(b"other-ikm").unwrap();
+    assert_ne!(pk1, pk3);
+
+    // The derived key pair is a working HPKE key pair.
+    let ct = cs.hpke_seal(&pk1, b"info", None, b"derived").unwrap();
+    let pt = cs.hpke_open(&ct, &sk1, &pk1, b"info", None).unwrap();
+    assert_eq!(&*pt, b"derived");
 }
 
 // Verify HPKE wire interop between CryptoKit and AWS-LC ML-KEM-768 providers.
@@ -603,9 +612,8 @@ impl CipherSuiteProvider for CryptoKitMlKemCipherSuite {
         self.hpke.generate().map_err(|e| e.into())
     }
 
-    fn kem_derive(&self, _ikm: &[u8]) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
-        // CryptoKit's MLKEM768 has no seed-based key generation API; derive is not supported.
-        Err(CryptoKitError::KemError(KemError::NotSupported))
+    fn kem_derive(&self, ikm: &[u8]) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
+        self.hpke.derive(ikm).map_err(|e| e.into())
     }
 
     fn kem_public_key_validate(&self, _key: &HpkePublicKey) -> Result<(), Self::Error> {
