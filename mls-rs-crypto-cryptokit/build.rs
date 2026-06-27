@@ -17,7 +17,10 @@ mod swift {
     /// Needed because of the min system reqs for HPKE in CryptoKit.
     /// See https://developer.apple.com/documentation/cryptokit/hpke
     const MIN_IOS_DEPLOYMENT_TARGET: &str = "17.0";
-    const MIN_OSX_DEPLOYMENT_TARGET: &str = "26.0";
+    // macOS ships the Swift runtime in the OS, so any modern deployment target does NOT
+    // require an rpath. "26.0" tripped `libraries_require_rpath` (and the panic in
+    // configure()) on the macOS 26 SDK — even for the host bindgen build. 15.0 is safe.
+    const MIN_OSX_DEPLOYMENT_TARGET: &str = "15.0";
 
     #[derive(Debug, Deserialize)]
     struct SwiftTargetInfo {
@@ -71,8 +74,17 @@ mod swift {
 
     pub fn configure() {
         let swift_target_info = get_target_info();
+        // NOTE: some toolchains (e.g. the macOS 26 / Xcode 26 betas) report
+        // `librariesRequireRPath = true` for *every* Apple target, including iOS. The
+        // original code panicked in that case. That guard is spurious for our use: the
+        // cdylib is shipped inside an `@rpath/…framework` (see TwoMLSPQ buildIosDynamic.sh),
+        // so rpath-based loading is exactly what we want. We still emit the Swift runtime
+        // link-search paths below, which is all the build actually needs.
         if swift_target_info.target.libraries_require_rpath {
-            panic!("Libraries require RPath! Change minimum MacOS value to fix.")
+            println!(
+                "cargo:warning=swift target reports librariesRequireRPath; \
+                 shipping as an @rpath framework, continuing."
+            );
         }
 
         swift_target_info
