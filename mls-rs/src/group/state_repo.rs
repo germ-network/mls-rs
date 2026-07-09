@@ -134,7 +134,7 @@ where
             .transpose()
     }
 
-    #[cfg(feature = "private_message")]
+    #[cfg(any(feature = "private_message", feature = "safe_export_secret"))]
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     pub async fn get_epoch_mut(
         &mut self,
@@ -240,7 +240,11 @@ where
         Ok(())
     }
 
-    #[cfg(any(feature = "psk", feature = "private_message"))]
+    #[cfg(any(
+        feature = "psk",
+        feature = "private_message",
+        feature = "safe_export_secret"
+    ))]
     fn find_pending(&self, epoch_id: u64) -> Option<usize> {
         self.pending_commit
             .updates

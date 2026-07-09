@@ -359,6 +359,13 @@ pub enum MlsError {
     DefaultValueListed,
     #[cfg_attr(feature = "std", error("not a subgroup"))]
     NotASubgroup,
+    #[cfg_attr(
+        feature = "std",
+        error("Object id must be between 1 and 255 bytes long")
+    )]
+    InvalidObjectId,
+    #[cfg_attr(feature = "std", error("Application export secret deleted"))]
+    ApplicationExportSecretDeleted,
 }
 
 impl IntoAnyError for MlsError {

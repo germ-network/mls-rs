@@ -78,6 +78,9 @@ pub(crate) struct EpochSecrets {
     pub(crate) sender_data_secret: SenderDataSecret,
     #[cfg(any(feature = "secret_tree_access", feature = "private_message"))]
     pub(crate) secret_tree: SecretTree<NodeIndex>,
+    #[cfg(feature = "safe_export_secret")]
+    #[mls_codec(with = "mls_rs_codec::byte_vec")]
+    pub(crate) application_export_secret: ApplicationExportSecret,
 }
 
 #[derive(Clone, PartialEq, MlsEncode, MlsDecode, MlsSize)]
@@ -120,6 +123,55 @@ impl From<Zeroizing<Vec<u8>>> for SenderDataSecret {
     }
 }
 
+/// The `application_export_secret` of draft-ietf-mls-extensions, derived
+/// from the epoch secret with the label `"application_export"`. An empty value
+/// means the secret was deleted.
+#[cfg(feature = "safe_export_secret")]
+#[derive(Clone, Default, PartialEq, MlsEncode, MlsDecode, MlsSize)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub(crate) struct ApplicationExportSecret(
+    #[mls_codec(with = "mls_rs_codec::byte_vec")]
+    #[cfg_attr(feature = "serde", serde(with = "mls_rs_core::zeroizing_serde"))]
+    Zeroizing<Vec<u8>>,
+);
+
+#[cfg(feature = "safe_export_secret")]
+impl Debug for ApplicationExportSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApplicationExportSecret").finish()
+    }
+}
+
+#[cfg(feature = "safe_export_secret")]
+impl AsRef<[u8]> for ApplicationExportSecret {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[cfg(feature = "safe_export_secret")]
+impl Deref for ApplicationExportSecret {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(feature = "safe_export_secret")]
+impl From<Vec<u8>> for ApplicationExportSecret {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+}
+
+#[cfg(feature = "safe_export_secret")]
+impl From<Zeroizing<Vec<u8>>> for ApplicationExportSecret {
+    fn from(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self(bytes)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_utils {
     use mls_rs_core::crypto::CipherSuiteProvider;
@@ -148,6 +200,8 @@ pub(crate) mod test_utils {
             sender_data_secret: random_bytes(cs_provider.kdf_extract_size()).into(),
             #[cfg(any(feature = "secret_tree_access", feature = "private_message"))]
             secret_tree,
+            #[cfg(feature = "safe_export_secret")]
+            application_export_secret: random_bytes(cs_provider.kdf_extract_size()).into(),
         }
     }
 

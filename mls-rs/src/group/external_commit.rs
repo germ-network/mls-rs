@@ -213,6 +213,8 @@ impl<C: ClientConfig> ExternalCommitBuilder<C> {
             sender_data_secret: SenderDataSecret::from(vec![]),
             #[cfg(any(feature = "secret_tree_access", feature = "private_message"))]
             secret_tree: SecretTree::empty(),
+            #[cfg(feature = "safe_export_secret")]
+            application_export_secret: Default::default(),
         };
 
         let (mut group, _) = Group::join_with(

@@ -87,6 +87,8 @@ use secret_tree::*;
 #[cfg(feature = "prior_epoch")]
 use self::epoch::PriorEpoch;
 
+#[cfg(all(feature = "safe_export_secret", feature = "prior_epoch"))]
+use self::epoch::ApplicationExportSecret;
 use self::epoch::EpochSecrets;
 pub use self::message_processor::{
     ApplicationMessageDescription, CommitEffect, CommitMessageDescription, NewEpoch,
@@ -136,6 +138,8 @@ pub(crate) mod proposal_ref;
 #[cfg(feature = "psk")]
 mod resumption;
 mod roster;
+#[cfg(feature = "safe_export_secret")]
+pub(crate) mod safe_export;
 pub(crate) mod snapshot;
 pub(crate) mod state;
 
@@ -1958,6 +1962,142 @@ where
     /// [Group::export_secret].
     pub fn delete_exporter(&mut self) {
         self.key_schedule.delete_exporter();
+    }
+
+    /// Derive the component secret `SafeExportSecret(component_id)` of
+    /// [draft-ietf-mls-extensions](https://datatracker.ietf.org/doc/draft-ietf-mls-extensions/)
+    /// for the current epoch, as consumed by
+    /// [draft-sullivan-mls-attachments](https://datatracker.ietf.org/doc/draft-sullivan-mls-attachments/).
+    ///
+    /// The secret is derived from the epoch's `application_export_secret` by
+    /// walking a depth-16 exporter tree, branching on the bits of
+    /// `component_id`. Until IANA assigns component ids, callers should pin a
+    /// private-use value (0x8000..=0xFFFF).
+    ///
+    /// Note that enabling the `safe_export_secret` feature adds a field to the
+    /// serialized group state, so state stored without the feature enabled
+    /// cannot be loaded with it enabled (and vice versa).
+    ///
+    /// Fails with [MlsError::ApplicationExportSecretDeleted] after
+    /// [Group::delete_application_export_secret] has been called in the
+    /// current epoch.
+    #[cfg(feature = "safe_export_secret")]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub async fn safe_export_secret(&self, component_id: u16) -> Result<Secret, MlsError> {
+        safe_export::safe_export_secret(
+            &self.cipher_suite_provider,
+            self.epoch_secrets.application_export_secret.as_ref(),
+            component_id,
+        )
+        .await
+        .map(Into::into)
+    }
+
+    /// Derive the 32-byte content encryption key for an attachment as defined
+    /// by [draft-sullivan-mls-attachments](https://datatracker.ietf.org/doc/draft-sullivan-mls-attachments/):
+    /// `ExpandWithLabel(SafeExportSecret(component_id), ComponentOperationLabel,
+    /// object_id, 32)` with the `ComponentOperationLabel` label `"attachment"`
+    /// (see [draft-ietf-mls-extensions](https://datatracker.ietf.org/doc/draft-ietf-mls-extensions/)).
+    ///
+    /// `object_id` must be between 1 and 255 bytes long.
+    ///
+    /// Note that enabling the `safe_export_secret` feature adds a field to the
+    /// serialized group state, so state stored without the feature enabled
+    /// cannot be loaded with it enabled (and vice versa).
+    #[cfg(feature = "safe_export_secret")]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub async fn attachment_cek(
+        &self,
+        component_id: u16,
+        object_id: &[u8],
+    ) -> Result<Secret, MlsError> {
+        safe_export::attachment_cek(
+            &self.cipher_suite_provider,
+            self.epoch_secrets.application_export_secret.as_ref(),
+            component_id,
+            object_id,
+        )
+        .await
+        .map(Into::into)
+    }
+
+    /// Same as [Group::safe_export_secret] but for a prior epoch still present
+    /// in the group state storage retention window.
+    ///
+    /// Fails with [MlsError::EpochNotFound] if the epoch is unknown or no
+    /// longer stored.
+    #[cfg(all(feature = "safe_export_secret", feature = "prior_epoch"))]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub async fn safe_export_secret_at_epoch(
+        &mut self,
+        component_id: u16,
+        epoch_id: u64,
+    ) -> Result<Secret, MlsError> {
+        let root = self.application_export_secret_at_epoch(epoch_id).await?;
+
+        safe_export::safe_export_secret(&self.cipher_suite_provider, root.as_ref(), component_id)
+            .await
+            .map(Into::into)
+    }
+
+    /// Same as [Group::attachment_cek] but for a prior epoch still present in
+    /// the group state storage retention window.
+    ///
+    /// Fails with [MlsError::EpochNotFound] if the epoch is unknown or no
+    /// longer stored.
+    #[cfg(all(feature = "safe_export_secret", feature = "prior_epoch"))]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub async fn attachment_cek_at_epoch(
+        &mut self,
+        component_id: u16,
+        object_id: &[u8],
+        epoch_id: u64,
+    ) -> Result<Secret, MlsError> {
+        let root = self.application_export_secret_at_epoch(epoch_id).await?;
+
+        safe_export::attachment_cek(
+            &self.cipher_suite_provider,
+            root.as_ref(),
+            component_id,
+            object_id,
+        )
+        .await
+        .map(Into::into)
+    }
+
+    #[cfg(all(feature = "safe_export_secret", feature = "prior_epoch"))]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    async fn application_export_secret_at_epoch(
+        &mut self,
+        epoch_id: u64,
+    ) -> Result<ApplicationExportSecret, MlsError> {
+        if epoch_id == self.context().epoch {
+            return Ok(self.epoch_secrets.application_export_secret.clone());
+        }
+
+        let epoch = self
+            .state_repo
+            .get_epoch_mut(epoch_id)
+            .await?
+            .ok_or(MlsError::EpochNotFound)?;
+
+        Ok(epoch.secrets.application_export_secret.clone())
+    }
+
+    /// Delete the current epoch's `application_export_secret`. Afterwards
+    /// [Group::safe_export_secret] and [Group::attachment_cek] fail with
+    /// [MlsError::ApplicationExportSecretDeleted] until the next epoch,
+    /// providing forward secrecy for all keys derived from it, analogous to
+    /// [Group::delete_exporter].
+    ///
+    /// This deletion schedule deliberately diverges from the delete-on-consume
+    /// schedule of draft-ietf-mls-extensions: the secret is retained for the
+    /// lifetime of the epoch (and for prior epochs within the state storage
+    /// retention window, still reachable via
+    /// [Group::attachment_cek_at_epoch]) unless this function is called.
+    #[cfg(feature = "safe_export_secret")]
+    pub fn delete_application_export_secret(&mut self) {
+        self.epoch_secrets.application_export_secret = Default::default();
     }
 
     /// Export the current epoch's ratchet tree in serialized format.
@@ -6888,6 +7028,91 @@ mod tests {
         group.commit(vec![]).await.unwrap();
         group.apply_pending_commit().await.unwrap();
         group.export_secret(b"123", b"", 15).await.unwrap();
+    }
+
+    #[cfg(feature = "safe_export_secret")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn attachment_cek_matches_between_members() {
+        let mut alice = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+        let (bob, _) = alice.join("bob").await;
+
+        let alice_component = alice.safe_export_secret(0x8000).await.unwrap();
+        let bob_component = bob.safe_export_secret(0x8000).await.unwrap();
+        assert_eq!(alice_component, bob_component);
+
+        let alice_cek = alice.attachment_cek(0x8000, b"object").await.unwrap();
+        let bob_cek = bob.attachment_cek(0x8000, b"object").await.unwrap();
+
+        assert_eq!(alice_cek, bob_cek);
+        assert_eq!(alice_cek.as_bytes().len(), 32);
+    }
+
+    #[cfg(feature = "safe_export_secret")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn attachment_cek_changes_across_epochs() {
+        let mut group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+
+        let cek_before = group.attachment_cek(0x8000, b"object").await.unwrap();
+
+        group.commit(vec![]).await.unwrap();
+        group.apply_pending_commit().await.unwrap();
+
+        let cek_after = group.attachment_cek(0x8000, b"object").await.unwrap();
+
+        assert_ne!(cek_before, cek_after);
+    }
+
+    #[cfg(all(feature = "safe_export_secret", feature = "prior_epoch"))]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn attachment_cek_at_prior_epoch() {
+        let mut group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+
+        let prior_epoch_id = group.context().epoch;
+        let cek_before = group.attachment_cek(0x8000, b"object").await.unwrap();
+
+        group.commit(vec![]).await.unwrap();
+        group.apply_pending_commit().await.unwrap();
+
+        let cek_prior = group
+            .attachment_cek_at_epoch(0x8000, b"object", prior_epoch_id)
+            .await
+            .unwrap();
+
+        assert_eq!(cek_before, cek_prior);
+
+        let current_epoch_id = group.context().epoch;
+
+        let cek_current = group
+            .attachment_cek_at_epoch(0x8000, b"object", current_epoch_id)
+            .await
+            .unwrap();
+
+        let cek_now = group.attachment_cek(0x8000, b"object").await.unwrap();
+        assert_eq!(cek_current, cek_now);
+
+        let res = group.attachment_cek_at_epoch(0x8000, b"object", 999).await;
+        assert_matches!(res, Err(MlsError::EpochNotFound));
+    }
+
+    #[cfg(feature = "safe_export_secret")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn delete_application_export_secret() {
+        let mut group = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+
+        group.attachment_cek(0x8000, b"object").await.unwrap();
+
+        group.delete_application_export_secret();
+
+        let res = group.safe_export_secret(0x8000).await;
+        assert_matches!(res, Err(MlsError::ApplicationExportSecretDeleted));
+
+        let res = group.attachment_cek(0x8000, b"object").await;
+        assert_matches!(res, Err(MlsError::ApplicationExportSecretDeleted));
+
+        group.commit(vec![]).await.unwrap();
+        group.apply_pending_commit().await.unwrap();
+
+        group.attachment_cek(0x8000, b"object").await.unwrap();
     }
 
     #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]

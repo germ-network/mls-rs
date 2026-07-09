@@ -716,6 +716,76 @@ impl Group {
         Ok(messages)
     }
 
+    /// Derive the component secret `SafeExportSecret(component_id)` of
+    /// [draft-ietf-mls-extensions](https://datatracker.ietf.org/doc/draft-ietf-mls-extensions/)
+    /// for the current epoch, as consumed by
+    /// [draft-sullivan-mls-attachments](https://datatracker.ietf.org/doc/draft-sullivan-mls-attachments/).
+    ///
+    /// Until IANA assigns component ids, callers should pin a private-use
+    /// value (0x8000..=0xFFFF).
+    ///
+    /// See [`mls_rs::Group::safe_export_secret`] for details, including the
+    /// stored group state compatibility caveat of the `safe_export_secret`
+    /// feature.
+    pub async fn safe_export_secret(&self, component_id: u16) -> Result<Vec<u8>, Error> {
+        let group = self.inner().await;
+        let secret = group.safe_export_secret(component_id).await?;
+        Ok(secret.as_bytes().to_vec())
+    }
+
+    /// Derive the 32-byte attachment content encryption key of
+    /// [draft-sullivan-mls-attachments](https://datatracker.ietf.org/doc/draft-sullivan-mls-attachments/)
+    /// for the current epoch.
+    ///
+    /// `object_id` must be between 1 and 255 bytes long.
+    ///
+    /// See [`mls_rs::Group::attachment_cek`] for details, including the
+    /// stored group state compatibility caveat of the `safe_export_secret`
+    /// feature.
+    pub async fn attachment_cek(
+        &self,
+        component_id: u16,
+        object_id: Vec<u8>,
+    ) -> Result<Vec<u8>, Error> {
+        let group = self.inner().await;
+        let cek = group.attachment_cek(component_id, &object_id).await?;
+        Ok(cek.as_bytes().to_vec())
+    }
+
+    /// Derive the 32-byte attachment content encryption key of
+    /// [draft-sullivan-mls-attachments](https://datatracker.ietf.org/doc/draft-sullivan-mls-attachments/)
+    /// for a prior epoch still present in the group state storage retention
+    /// window.
+    ///
+    /// See [`mls_rs::Group::attachment_cek_at_epoch`] for details.
+    pub async fn attachment_cek_at_epoch(
+        &self,
+        component_id: u16,
+        object_id: Vec<u8>,
+        epoch_id: u64,
+    ) -> Result<Vec<u8>, Error> {
+        let mut group = self.inner().await;
+
+        let cek = group
+            .attachment_cek_at_epoch(component_id, &object_id, epoch_id)
+            .await?;
+
+        Ok(cek.as_bytes().to_vec())
+    }
+
+    /// Delete the current epoch's `application_export_secret`, providing
+    /// forward secrecy for all keys derived from it. Afterwards
+    /// [`Group::safe_export_secret`] and [`Group::attachment_cek`] fail until
+    /// the next epoch.
+    ///
+    /// See [`mls_rs::Group::delete_application_export_secret`] for details on
+    /// how this deletion schedule diverges from draft-ietf-mls-extensions.
+    pub async fn delete_application_export_secret(&self) -> Result<(), Error> {
+        let mut group = self.inner().await;
+        group.delete_application_export_secret();
+        Ok(())
+    }
+
     /// Encrypt an application message using the current group state.
     ///
     /// An application message is an application-specific payload,

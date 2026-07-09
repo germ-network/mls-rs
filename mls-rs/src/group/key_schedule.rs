@@ -194,6 +194,10 @@ impl KeySchedule {
                 secret_tree_size,
                 secrets_producer.derive(b"encryption").await?,
             ),
+            // draft-ietf-mls-extensions: application_export_secret =
+            // DeriveSecret(epoch_secret, "application_export")
+            #[cfg(feature = "safe_export_secret")]
+            application_export_secret: secrets_producer.derive(b"application_export").await?.into(),
         };
 
         let key_schedule = Self {
