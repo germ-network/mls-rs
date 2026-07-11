@@ -14,6 +14,9 @@ use crate::CipherSuiteProvider;
 #[cfg(any(feature = "secret_tree_access", feature = "private_message"))]
 use crate::group::SecretTree;
 
+#[cfg(feature = "safe_extensions")]
+use crate::group::exporter_tree::ExporterTree;
+
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug};
@@ -194,6 +197,12 @@ impl KeySchedule {
                 secret_tree_size,
                 secrets_producer.derive(b"encryption").await?,
             ),
+            // draft-ietf-mls-extensions-08 Section 4.4: application_export_secret =
+            // DeriveSecret(epoch_secret, "application_export"), derived at the
+            // beginning of the epoch in the same way as the other secrets in
+            // Table 4 of RFC 9420. It forms the root of the Exporter Tree.
+            #[cfg(feature = "safe_extensions")]
+            exporter_tree: ExporterTree::new(secrets_producer.derive(b"application_export").await?),
         };
 
         let key_schedule = Self {

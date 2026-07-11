@@ -333,18 +333,40 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+
+    #[cfg(all(
+        feature = "std",
+        feature = "by_ref_proposal",
+        not(feature = "safe_extensions")
+    ))]
     use mls_rs_core::group::{GroupState, GroupStateStorage};
 
+    #[cfg(all(
+        feature = "std",
+        feature = "by_ref_proposal",
+        not(feature = "safe_extensions")
+    ))]
     use crate::{
-        client::test_utils::{TestClientBuilder, TEST_CIPHER_SUITE, TEST_PROTOCOL_VERSION},
+        client::test_utils::TestClientBuilder,
+        storage_provider::in_memory::InMemoryGroupStateStorage,
+    };
+
+    use crate::{
+        client::test_utils::{TEST_CIPHER_SUITE, TEST_PROTOCOL_VERSION},
         group::{
             test_utils::{test_group, TestGroup},
             Group,
         },
-        storage_provider::in_memory::InMemoryGroupStateStorage,
     };
 
-    #[cfg(all(feature = "std", feature = "by_ref_proposal"))]
+    // The `safe_extensions` feature adds a field to the serialized
+    // `EpochSecrets`, so snapshots stored without the feature enabled cannot
+    // be decoded with it enabled.
+    #[cfg(all(
+        feature = "std",
+        feature = "by_ref_proposal",
+        not(feature = "safe_extensions")
+    ))]
     #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
     async fn legacy_interop() {
         let mut storage = InMemoryGroupStateStorage::new();

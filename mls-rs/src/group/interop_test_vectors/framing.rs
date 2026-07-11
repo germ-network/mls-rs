@@ -433,6 +433,8 @@ async fn make_group<P: CipherSuiteProvider>(
         secret_tree,
         resumption_secret: vec![0_u8; cs.kdf_extract_size()].into(),
         sender_data_secret: test_case.sender_data_secret.clone().into(),
+        #[cfg(feature = "safe_extensions")]
+        exporter_tree: crate::group::exporter_tree::ExporterTree::empty(),
     };
 
     group.epoch_secrets = secrets;
