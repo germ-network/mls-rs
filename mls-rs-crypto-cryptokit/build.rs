@@ -18,9 +18,18 @@ mod swift {
         process::Command,
     };
 
-    /// Needed because of the min system reqs for HPKE in CryptoKit.
+    /// Needed because of the min system reqs for ML-KEM in CryptoKit (OS 26 on every
+    /// platform); HPKE alone would allow iOS 17 / macOS 15.
     /// See https://developer.apple.com/documentation/cryptokit/hpke
-    const MIN_IOS_DEPLOYMENT_TARGET: &str = "17.0";
+    ///
+    /// These constants only feed the `swift -print-target-info` triple below (and thus
+    /// the runtime library search paths) — the bridge's own compilation floor is its
+    /// Package.swift `platforms`, and the consuming dylib's minos comes from the
+    /// caller's *_DEPLOYMENT_TARGET env. They must name an OS version whose Swift
+    /// runtime satisfies the toolchain without rpath'd back-deployment libraries:
+    /// Swift 6.2+/Xcode 26+ drivers report `librariesRequireRPath: true` for any
+    /// deployment target below 26.0, which trips the panic in `configure()`.
+    const MIN_IOS_DEPLOYMENT_TARGET: &str = "26.0";
     const MIN_OSX_DEPLOYMENT_TARGET: &str = "26.0";
 
     #[derive(Debug, Deserialize)]
