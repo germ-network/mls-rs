@@ -38,7 +38,10 @@ use crate::{
 };
 
 #[cfg(feature = "safe_extensions")]
-use crate::{group::component_operation::ComponentID, psk::ApplicationPsk};
+use crate::{
+    group::{component_operation::ComponentID, exporter_tree::ExporterTree},
+    psk::ApplicationPsk,
+};
 
 use super::{
     confirmation_tag::ConfirmationTag,
@@ -253,6 +256,16 @@ where
         component_id: ComponentID,
         psk_id: Vec<u8>,
     ) -> Result<Self, MlsError> {
+        // An application PSK is resolved from a value exported with
+        // `SafeExportSecret(component_id)` (see [`Group::safe_export_secret`]),
+        // whose Exporter Tree has only 2^16 leaves. Reject an out-of-range
+        // component_id where the caller supplies it, so a commit can never
+        // reference an application PSK that no member could have exported to
+        // install — the same bound `ExporterTree::safe_export_secret` enforces
+        // on the export side.
+        if component_id >= ExporterTree::LEAF_COUNT {
+            return Err(MlsError::InvalidComponentId);
+        }
         let key_id = JustPreSharedKeyID::Application(ApplicationPsk::new(component_id, psk_id));
         let proposal = self.group.psk_proposal(key_id)?;
         self.proposals.push(proposal);
