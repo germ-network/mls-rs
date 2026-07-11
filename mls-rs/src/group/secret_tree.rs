@@ -243,6 +243,44 @@ impl<T: TreeIndex> SecretTree<T> {
         })
     }
 
+    /// Take the `tree_node_secret` at the leaf node `leaf_index`, consuming it.
+    ///
+    /// Any intermediate node secrets on the path from the root to the leaf are
+    /// deleted as soon as their children are derived, and the leaf secret
+    /// itself is deleted upon being returned, following the deletion schedule
+    /// in RFC 9420 Section 9.2. Requesting the same leaf twice is an error.
+    #[cfg(feature = "safe_extensions")]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub(crate) async fn take_leaf_secret<P: CipherSuiteProvider>(
+        &mut self,
+        cipher_suite_provider: &P,
+        leaf_index: T,
+    ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        // An empty tree (e.g. the placeholder state used while building an
+        // external commit) has no root secret to consume.
+        if self.leaf_count == T::default() {
+            return Err(MlsError::ComponentSecretConsumed);
+        }
+
+        let node = match self.known_secrets.take_node(&leaf_index) {
+            Some(node) => node,
+            None => {
+                // Start at the root node and work your way down consuming any intermediates needed
+                for i in leaf_index.direct_copath(&self.leaf_count).into_iter().rev() {
+                    self.consume_node(cipher_suite_provider, &i.path).await?;
+                }
+
+                self.known_secrets
+                    .take_node(&leaf_index)
+                    .ok_or(MlsError::ComponentSecretConsumed)?
+            }
+        };
+
+        node.into_secret()
+            .map(|secret| secret.0)
+            .ok_or(MlsError::ComponentSecretConsumed)
+    }
+
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     pub async fn next_message_key<P: CipherSuiteProvider>(
         &mut self,
