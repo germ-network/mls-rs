@@ -150,11 +150,24 @@ mod util;
 /// External commit building.
 pub mod external_commit;
 
-#[cfg(any(feature = "secret_tree_access", feature = "private_message"))]
+// With only `safe_extensions` enabled the secret tree is used exclusively by
+// the exporter tree, leaving the message key ratchets dead code.
+#[cfg(any(
+    feature = "secret_tree_access",
+    feature = "private_message",
+    feature = "safe_extensions"
+))]
+#[cfg_attr(
+    not(any(feature = "secret_tree_access", feature = "private_message")),
+    allow(dead_code)
+)]
 pub(crate) mod secret_tree;
 
 #[cfg(any(feature = "secret_tree_access", feature = "private_message"))]
 pub use secret_tree::MessageKeyData as MessageKey;
+
+#[cfg(feature = "safe_extensions")]
+pub(crate) mod exporter_tree;
 
 #[cfg(all(test, feature = "rfc_compliant"))]
 mod interop_test_vectors;
@@ -1858,6 +1871,51 @@ where
     /// [Group::export_secret].
     pub fn delete_exporter(&mut self) {
         self.key_schedule.delete_exporter();
+    }
+
+    /// Export the forward-secure secret for the application component
+    /// `component_id` from the Exporter Tree of the current epoch
+    /// (`SafeExportSecret` from draft-ietf-mls-extensions-08 Section 4.4).
+    ///
+    /// All members of the group derive the same secret for the same epoch and
+    /// component id, and secrets for distinct component ids are independent.
+    /// Unlike [`Group::export_secret`], this export is forward secure: the
+    /// component's secret is regarded as consumed once exported, its source
+    /// key material is deleted according to the deletion schedule in RFC 9420
+    /// Section 9.2, and exporting the same component again in the same epoch
+    /// fails with [`MlsError::ComponentSecretConsumed`].
+    ///
+    /// Values bound to a component can be derived from the returned secret
+    /// with [`Group::derive_secret`], e.g. `DeriveSecret(exported, "psk_id")`
+    /// and `DeriveSecret(exported, "psk")` of draft-ietf-mls-combiner-02.
+    ///
+    /// `component_id` must be less than 2^16, the number of leaves of the
+    /// Exporter Tree.
+    #[cfg(feature = "safe_extensions")]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub async fn safe_export_secret(
+        &mut self,
+        component_id: ComponentID,
+    ) -> Result<Secret, MlsError> {
+        self.epoch_secrets
+            .exporter_tree
+            .safe_export_secret(&self.cipher_suite_provider, component_id)
+            .await
+            .map(Into::into)
+    }
+
+    /// `DeriveSecret(secret, label)` from RFC 9420 Section 8, using this
+    /// group's cipher suite.
+    ///
+    /// This is intended for deriving independent values from a secret
+    /// exported with [`Group::safe_export_secret`], which can only be
+    /// exported once per epoch.
+    #[cfg(feature = "safe_extensions")]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub async fn derive_secret(&self, secret: &[u8], label: &[u8]) -> Result<Secret, MlsError> {
+        key_schedule::kdf_derive_secret(&self.cipher_suite_provider, secret, label)
+            .await
+            .map(Into::into)
     }
 
     /// Export the current epoch's ratchet tree in serialized format.
@@ -6984,5 +7042,61 @@ mod tests {
             .build()
             .await
             .unwrap();
+    }
+
+    #[cfg(feature = "safe_extensions")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn safe_export_secret_agrees_between_members_and_is_consumed() {
+        let mut alice = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+        let (mut bob, _) = alice.join("bob").await;
+
+        let component_a = 0xBEE0;
+        let component_b = 0xBEE1;
+
+        let alice_export = alice.group.safe_export_secret(component_a).await.unwrap();
+        let bob_export = bob.group.safe_export_secret(component_a).await.unwrap();
+
+        // Members agree on the exported secret for the same epoch and
+        // component, and distinct components have independent secrets.
+        assert_eq!(alice_export, bob_export);
+
+        let other_export = alice.group.safe_export_secret(component_b).await.unwrap();
+        assert_ne!(alice_export, other_export);
+
+        // The component's secret is consumed by the export.
+        let res = alice.group.safe_export_secret(component_a).await;
+        assert_matches!(res, Err(MlsError::ComponentSecretConsumed));
+
+        // Members agree on values derived from the exported secret, and
+        // distinct labels give independent values.
+        let alice_psk_id = alice
+            .group
+            .derive_secret(&alice_export, b"psk_id")
+            .await
+            .unwrap();
+
+        let bob_psk_id = bob
+            .group
+            .derive_secret(&bob_export, b"psk_id")
+            .await
+            .unwrap();
+
+        assert_eq!(alice_psk_id, bob_psk_id);
+
+        let alice_psk = alice
+            .group
+            .derive_secret(&alice_export, b"psk")
+            .await
+            .unwrap();
+
+        assert_ne!(alice_psk, alice_psk_id);
+
+        // A new epoch has a new exporter tree, so a consumed component can be
+        // exported again with a fresh value.
+        alice.group.commit(vec![]).await.unwrap();
+        alice.process_pending_commit().await.unwrap();
+
+        let next_epoch_export = alice.group.safe_export_secret(component_a).await.unwrap();
+        assert_ne!(next_epoch_export, alice_export);
     }
 }
