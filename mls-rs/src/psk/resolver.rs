@@ -72,6 +72,12 @@ impl<GS: GroupStateStorage, K: KeyPackageStorage, PS: PreSharedKeyStorage>
                 JustPreSharedKeyID::Resumption(resumption) => {
                     self.resolve_resumption(resumption).await
                 }
+                // Application PSKs are resolved from the same storage as
+                // external PSKs, keyed by `ApplicationPsk::storage_id`.
+                #[cfg(feature = "safe_extensions")]
+                JustPreSharedKeyID::Application(application) => {
+                    self.resolve_external(&application.storage_id()?).await
+                }
             }?;
 
             secret_inputs.push(PskSecretInput {
