@@ -7209,6 +7209,31 @@ mod tests {
         assert_matches!(res, Err(MlsError::MissingRequiredPsk));
     }
 
+    // An application PSK's component_id must fit the 2^16-leaf Exporter Tree —
+    // the same bound `safe_export_secret` enforces. `add_application_psk`
+    // rejects an out-of-range id up front, so a commit can never reference an
+    // application PSK no member could have exported to install.
+    #[cfg(feature = "safe_extensions")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn application_psk_rejects_out_of_range_component_id() {
+        let mut alice = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+
+        // 1 << 16 is the first index past the last leaf.
+        let res = alice
+            .group
+            .commit_builder()
+            .add_application_psk(1 << 16, b"psk".to_vec())
+            .map(|_| ());
+        assert_matches!(res, Err(MlsError::InvalidComponentId));
+
+        // The last in-range leaf (2^16 - 1) is accepted.
+        assert!(alice
+            .group
+            .commit_builder()
+            .add_application_psk((1 << 16) - 1, b"psk".to_vec())
+            .is_ok());
+    }
+
     // Proves the application PSK value is actually mixed into the key
     // schedule: a member whose stored value differs must fail to process the
     // commit. (Member-agreement alone cannot catch a regression that drops
