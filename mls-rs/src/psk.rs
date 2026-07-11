@@ -4,7 +4,7 @@
 
 use alloc::vec::Vec;
 
-#[cfg(any(test, feature = "external_client", feature = "safe_extensions"))]
+#[cfg(any(test, feature = "external_client"))]
 use alloc::vec;
 
 use mls_rs_codec::{MlsDecode, MlsEncode, MlsSize};
@@ -84,7 +84,7 @@ pub(crate) enum JustPreSharedKeyID {
 /// the core MLS protocol and those used by application components, and
 /// between different components.
 #[cfg(feature = "safe_extensions")]
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialOrd, PartialEq, MlsSize, MlsEncode, MlsDecode)]
+#[derive(Clone, Eq, Hash, Ord, PartialOrd, PartialEq, MlsSize, MlsEncode, MlsDecode)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ApplicationPsk {
@@ -92,6 +92,19 @@ pub struct ApplicationPsk {
     #[mls_codec(with = "mls_rs_codec::byte_vec")]
     #[cfg_attr(feature = "serde", serde(with = "mls_rs_core::vec_serde"))]
     pub(crate) psk_id: Vec<u8>,
+}
+
+#[cfg(feature = "safe_extensions")]
+impl Debug for ApplicationPsk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApplicationPsk")
+            .field("component_id", &self.component_id)
+            .field(
+                "psk_id",
+                &mls_rs_core::debug::pretty_bytes(&self.psk_id).named("psk_id"),
+            )
+            .finish()
+    }
 }
 
 #[cfg(feature = "safe_extensions")]
@@ -120,11 +133,18 @@ impl ApplicationPsk {
     /// cannot collide with the storage key of a different application PSK.
     /// Every member must insert the PSK value under this key before
     /// committing or processing a commit that references this identifier.
+    ///
+    /// Note that these keys live in the same [`ExternalPskId`] namespace as
+    /// the identifiers of genuine external PSKs; an application that also
+    /// uses external PSKs should avoid ids that start with the byte `0x03`
+    /// (or otherwise ensure they cannot equal a serialized application PSK
+    /// identifier). The MLS key schedule itself stays domain-separated
+    /// either way, since it binds the full typed `PreSharedKeyID`.
     pub fn storage_id(&self) -> Result<ExternalPskId, MlsError> {
-        // PSKType application(3) from draft-ietf-mls-extensions-08.
-        let mut bytes = vec![3u8];
-        self.mls_encode(&mut bytes)?;
-        Ok(ExternalPskId::new(bytes))
+        JustPreSharedKeyID::Application(self.clone())
+            .mls_encode_to_vec()
+            .map(ExternalPskId::new)
+            .map_err(Into::into)
     }
 }
 

@@ -38,6 +38,9 @@ use crate::group::proposal::PreSharedKeyProposal;
 #[cfg(feature = "psk")]
 use crate::group::{JustPreSharedKeyID, ResumptionPSKUsage, ResumptionPsk};
 
+#[cfg(feature = "psk")]
+use alloc::borrow::Cow;
+
 #[cfg(all(feature = "std", feature = "psk"))]
 use std::collections::HashSet;
 
@@ -417,9 +420,19 @@ where
         #[cfg(not(feature = "std"))]
         let is_new_id = !ids_seen.contains(&p.proposal.psk);
 
-        let external_id_is_valid = match &p.proposal.psk.key_id {
-            JustPreSharedKeyID::External(id) => psk_storage
-                .contains(id)
+        // The storage key whose presence must be validated, if any. Errors
+        // stay inside the result so that by-reference proposals go through
+        // `apply_strategy` like any other invalid proposal.
+        let storage_id = match &p.proposal.psk.key_id {
+            JustPreSharedKeyID::External(id) => Ok(Some(Cow::Borrowed(id))),
+            JustPreSharedKeyID::Resumption(_) => Ok(None),
+            #[cfg(feature = "safe_extensions")]
+            JustPreSharedKeyID::Application(psk) => psk.storage_id().map(|id| Some(Cow::Owned(id))),
+        };
+
+        let external_id_is_valid = match storage_id {
+            Ok(Some(id)) => psk_storage
+                .contains(&id)
                 .await
                 .map_err(|e| MlsError::PskStoreError(e.into_any_error()))
                 .and_then(|found| {
@@ -429,22 +442,8 @@ where
                         Err(MlsError::MissingRequiredPsk)
                     }
                 }),
-            JustPreSharedKeyID::Resumption(_) => Ok(()),
-            #[cfg(feature = "safe_extensions")]
-            JustPreSharedKeyID::Application(psk) => match psk.storage_id() {
-                Ok(storage_id) => psk_storage
-                    .contains(&storage_id)
-                    .await
-                    .map_err(|e| MlsError::PskStoreError(e.into_any_error()))
-                    .and_then(|found| {
-                        if found {
-                            Ok(())
-                        } else {
-                            Err(MlsError::MissingRequiredPsk)
-                        }
-                    }),
-                Err(e) => Err(e),
-            },
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
         };
 
         #[cfg(not(feature = "by_ref_proposal"))]
