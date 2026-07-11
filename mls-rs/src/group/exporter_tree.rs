@@ -68,7 +68,9 @@ impl ExporterTree {
         }
 
         // The leaf for component id `c` is at node index `2 c` in the array
-        // representation of RFC 9420 Section C (as in the Secret Tree).
+        // representation of RFC 9420 Appendix C, the same mapping as
+        // `From<LeafIndex> for NodeIndex` (a ComponentID is not a member
+        // LeafIndex, so the typed conversion does not apply here).
         self.0
             .take_leaf_secret(cipher_suite_provider, component_id * 2)
             .await
