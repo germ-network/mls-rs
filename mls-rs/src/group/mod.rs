@@ -1891,6 +1891,11 @@ where
     ///
     /// `component_id` must be less than 2^16, the number of leaves of the
     /// Exporter Tree.
+    ///
+    /// Note that the deletion schedule retains the copath of each consumed
+    /// leaf (up to 16 node secrets per export) so that other components stay
+    /// exportable; this state is part of the group's serialized snapshot
+    /// until the epoch advances.
     #[cfg(feature = "safe_extensions")]
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     pub async fn safe_export_secret(
@@ -1944,6 +1949,10 @@ where
     /// Determines equality of two different groups internal states.
     /// Useful for testing.
     ///
+    /// Note that member-local state that legitimately diverges between
+    /// synchronized members is included in the comparison — e.g. message key
+    /// ratchets, or exporter secrets consumed by [`Group::safe_export_secret`]
+    /// when the `safe_extensions` feature is enabled.
     pub fn equal_group_state(a: &Group<C>, b: &Group<C>) -> bool {
         a.state == b.state && a.key_schedule == b.key_schedule && a.epoch_secrets == b.epoch_secrets
     }
@@ -2206,10 +2215,21 @@ impl<C: ClientConfig> Group<C> {
             .map(|l| l.map(|n| n.signing_identity.signature_key.clone()))
             .collect();
 
+        let secrets = self.epoch_secrets.clone();
+
+        // The exporter tree can only be read while its epoch is current, so
+        // retaining it in a prior epoch would keep deletable key material
+        // alive with no reader (RFC 9420 Section 9.2).
+        #[cfg(feature = "safe_extensions")]
+        let secrets = EpochSecrets {
+            exporter_tree: exporter_tree::ExporterTree::empty(),
+            ..secrets
+        };
+
         let past_epoch = PriorEpoch {
             context: self.context().clone(),
             self_index: self.private_tree.self_index,
-            secrets: self.epoch_secrets.clone(),
+            secrets,
             signature_public_keys,
             #[cfg(feature = "prior_epoch_membership_key")]
             membership_key: self.key_schedule.membership_key.clone(),
@@ -7187,5 +7207,45 @@ mod tests {
             .await;
 
         assert_matches!(res, Err(MlsError::MissingRequiredPsk));
+    }
+
+    // Proves the application PSK value is actually mixed into the key
+    // schedule: a member whose stored value differs must fail to process the
+    // commit. (Member-agreement alone cannot catch a regression that drops
+    // the PSK symmetrically for all members.)
+    #[cfg(feature = "safe_extensions")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn application_psk_value_mismatch_fails() {
+        let mut alice = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+        let (mut bob, _) = alice.join("bob").await;
+
+        let component_id = 0x0042;
+        let psk_id = b"mismatch psk id".to_vec();
+
+        let storage_id = crate::psk::ApplicationPsk::new(component_id, psk_id.clone())
+            .storage_id()
+            .unwrap();
+
+        alice
+            .config
+            .secret_store()
+            .insert(storage_id.clone(), PreSharedKey::from(vec![1u8; 32]));
+
+        bob.config
+            .secret_store()
+            .insert(storage_id, PreSharedKey::from(vec![2u8; 32]));
+
+        let commit_output = alice
+            .group
+            .commit_builder()
+            .add_application_psk(component_id, psk_id)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let res = bob.process_message(commit_output.commit_message).await;
+
+        assert_matches!(res, Err(MlsError::InvalidConfirmationTag));
     }
 }
