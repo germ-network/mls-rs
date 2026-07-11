@@ -22,6 +22,9 @@ use super::ciphertext_processor::GroupStateProvider;
 #[cfg(any(feature = "secret_tree_access", feature = "private_message"))]
 use crate::group::secret_tree::SecretTree;
 
+#[cfg(feature = "safe_extensions")]
+use crate::group::exporter_tree::ExporterTree;
+
 #[cfg(feature = "prior_epoch")]
 #[derive(Debug, Clone, MlsEncode, MlsDecode, MlsSize, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -78,6 +81,8 @@ pub(crate) struct EpochSecrets {
     pub(crate) sender_data_secret: SenderDataSecret,
     #[cfg(any(feature = "secret_tree_access", feature = "private_message"))]
     pub(crate) secret_tree: SecretTree<NodeIndex>,
+    #[cfg(feature = "safe_extensions")]
+    pub(crate) exporter_tree: ExporterTree,
 }
 
 #[derive(Clone, PartialEq, MlsEncode, MlsDecode, MlsSize)]
@@ -148,6 +153,10 @@ pub(crate) mod test_utils {
             sender_data_secret: random_bytes(cs_provider.kdf_extract_size()).into(),
             #[cfg(any(feature = "secret_tree_access", feature = "private_message"))]
             secret_tree,
+            #[cfg(feature = "safe_extensions")]
+            exporter_tree: crate::group::exporter_tree::ExporterTree::new(zeroize::Zeroizing::new(
+                random_bytes(cs_provider.kdf_extract_size()),
+            )),
         }
     }
 
