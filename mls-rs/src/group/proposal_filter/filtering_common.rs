@@ -397,14 +397,16 @@ where
     for i in 0..proposals.psk_proposals().len() {
         let p = &proposals.psks[i];
 
-        let valid = matches!(
-            p.proposal.psk.key_id,
-            JustPreSharedKeyID::External(_)
-                | JustPreSharedKeyID::Resumption(ResumptionPsk {
-                    usage: ResumptionPSKUsage::Application,
-                    ..
-                })
-        );
+        let valid = match &p.proposal.psk.key_id {
+            JustPreSharedKeyID::External(_) => true,
+            JustPreSharedKeyID::Resumption(ResumptionPsk {
+                usage: ResumptionPSKUsage::Application,
+                ..
+            }) => true,
+            JustPreSharedKeyID::Resumption(_) => false,
+            #[cfg(feature = "safe_extensions")]
+            JustPreSharedKeyID::Application(_) => true,
+        };
 
         let nonce_length = p.proposal.psk.psk_nonce.0.len();
         let nonce_valid = nonce_length == kdf_extract_size;
@@ -428,6 +430,21 @@ where
                     }
                 }),
             JustPreSharedKeyID::Resumption(_) => Ok(()),
+            #[cfg(feature = "safe_extensions")]
+            JustPreSharedKeyID::Application(psk) => match psk.storage_id() {
+                Ok(storage_id) => psk_storage
+                    .contains(&storage_id)
+                    .await
+                    .map_err(|e| MlsError::PskStoreError(e.into_any_error()))
+                    .and_then(|found| {
+                        if found {
+                            Ok(())
+                        } else {
+                            Err(MlsError::MissingRequiredPsk)
+                        }
+                    }),
+                Err(e) => Err(e),
+            },
         };
 
         #[cfg(not(feature = "by_ref_proposal"))]
