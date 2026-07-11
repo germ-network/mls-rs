@@ -37,6 +37,9 @@ use crate::{
     psk::ExternalPskId,
 };
 
+#[cfg(feature = "safe_extensions")]
+use crate::{group::component_operation::ComponentID, psk::ApplicationPsk};
+
 use super::{
     confirmation_tag::ConfirmationTag,
     framing::{Content, MlsMessage, MlsMessagePayload, Sender},
@@ -228,6 +231,29 @@ where
     #[cfg(feature = "psk")]
     pub fn add_external_psk(mut self, psk_id: ExternalPskId) -> Result<Self, MlsError> {
         let key_id = JustPreSharedKeyID::External(psk_id);
+        let proposal = self.group.psk_proposal(key_id)?;
+        self.proposals.push(proposal);
+        Ok(self)
+    }
+
+    /// Insert a
+    /// [`PreSharedKeyProposal`](crate::group::proposal::PreSharedKeyProposal) with
+    /// an application PSK (`psk_type = application(3)` from
+    /// draft-ietf-mls-extensions-08) into the current commit that is being
+    /// built.
+    ///
+    /// Each group member will need to have the PSK value installed within the
+    /// [`PreSharedKeyStorage`](mls_rs_core::psk::PreSharedKeyStorage) in use
+    /// by this group under the key given by
+    /// [`ApplicationPsk::storage_id`](crate::psk::ApplicationPsk::storage_id)
+    /// upon processing a [commit](Group::commit) that contains this proposal.
+    #[cfg(feature = "safe_extensions")]
+    pub fn add_application_psk(
+        mut self,
+        component_id: ComponentID,
+        psk_id: Vec<u8>,
+    ) -> Result<Self, MlsError> {
+        let key_id = JustPreSharedKeyID::Application(ApplicationPsk::new(component_id, psk_id));
         let proposal = self.group.psk_proposal(key_id)?;
         self.proposals.push(proposal);
         Ok(self)
