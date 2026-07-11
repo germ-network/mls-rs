@@ -7123,4 +7123,93 @@ mod tests {
         let next_epoch_export = alice.group.safe_export_secret(component_a).await.unwrap();
         assert_ne!(next_epoch_export, alice_export);
     }
+
+    #[cfg(feature = "safe_extensions")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn application_psk_commit_end_to_end() {
+        let mut alice = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+        let (mut bob, _) = alice.join("bob").await;
+
+        let component_id = 0x0042;
+
+        // Both members export the component secret and derive the PSK id and
+        // value from it, as in Section 6.2 of draft-ietf-mls-combiner-02.
+        let alice_export = alice.group.safe_export_secret(component_id).await.unwrap();
+        let bob_export = bob.group.safe_export_secret(component_id).await.unwrap();
+
+        let psk_id = alice
+            .group
+            .derive_secret(&alice_export, b"psk_id")
+            .await
+            .unwrap();
+
+        let psk_value = alice
+            .group
+            .derive_secret(&alice_export, b"psk")
+            .await
+            .unwrap();
+
+        let bob_psk_id = bob
+            .group
+            .derive_secret(&bob_export, b"psk_id")
+            .await
+            .unwrap();
+        let bob_psk_value = bob.group.derive_secret(&bob_export, b"psk").await.unwrap();
+
+        assert_eq!(psk_id, bob_psk_id);
+        assert_eq!(psk_value, bob_psk_value);
+
+        // Both members install the PSK value under the application PSK
+        // storage key.
+        let storage_id = crate::psk::ApplicationPsk::new(component_id, psk_id.to_vec())
+            .storage_id()
+            .unwrap();
+
+        alice.config.secret_store().insert(
+            storage_id.clone(),
+            PreSharedKey::from(psk_value.as_bytes().to_vec()),
+        );
+
+        bob.config.secret_store().insert(
+            storage_id,
+            PreSharedKey::from(bob_psk_value.as_bytes().to_vec()),
+        );
+
+        // Alice commits the application PSK and Bob processes the commit.
+        let commit_output = alice
+            .group
+            .commit_builder()
+            .add_application_psk(component_id, psk_id.to_vec())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        alice.group.apply_pending_commit().await.unwrap();
+
+        bob.process_message(commit_output.commit_message)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            alice.group.epoch_authenticator().unwrap(),
+            bob.group.epoch_authenticator().unwrap()
+        );
+    }
+
+    #[cfg(feature = "safe_extensions")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn application_psk_commit_requires_stored_psk() {
+        let mut alice = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+
+        let res = alice
+            .group
+            .commit_builder()
+            .add_application_psk(0x0042, b"missing".to_vec())
+            .unwrap()
+            .build()
+            .await;
+
+        assert_matches!(res, Err(MlsError::MissingRequiredPsk));
+    }
 }
