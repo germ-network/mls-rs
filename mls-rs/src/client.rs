@@ -359,6 +359,16 @@ pub enum MlsError {
     DefaultValueListed,
     #[cfg_attr(feature = "std", error("not a subgroup"))]
     NotASubgroup,
+    #[cfg_attr(
+        feature = "std",
+        error("Component id out of range of the exporter tree (must be less than 2^16)")
+    )]
+    InvalidComponentId,
+    #[cfg_attr(
+        feature = "std",
+        error("Exported secret for this component was already consumed in this epoch")
+    )]
+    ComponentSecretConsumed,
 }
 
 impl IntoAnyError for MlsError {
