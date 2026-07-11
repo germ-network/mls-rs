@@ -188,7 +188,7 @@ impl PreSharedKeyProposal {
     pub fn application_psk(&self) -> Option<&ApplicationPsk> {
         match self.psk.key_id {
             JustPreSharedKeyID::Application(ref app) => Some(app),
-            _ => None,
+            JustPreSharedKeyID::External(_) | JustPreSharedKeyID::Resumption(_) => None,
         }
     }
 }
