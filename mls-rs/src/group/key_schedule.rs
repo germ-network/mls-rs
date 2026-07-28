@@ -14,6 +14,9 @@ use crate::CipherSuiteProvider;
 #[cfg(any(feature = "secret_tree_access", feature = "private_message"))]
 use crate::group::SecretTree;
 
+#[cfg(feature = "safe_extensions")]
+use crate::group::exporter_tree::ExporterTree;
+
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{self, Debug};
@@ -194,6 +197,12 @@ impl KeySchedule {
                 secret_tree_size,
                 secrets_producer.derive(b"encryption").await?,
             ),
+            // draft-ietf-mls-extensions-08 Section 4.4: application_export_secret =
+            // DeriveSecret(epoch_secret, "application_export"), derived at the
+            // beginning of the epoch in the same way as the other secrets in
+            // Table 4 of RFC 9420. It forms the root of the Exporter Tree.
+            #[cfg(feature = "safe_extensions")]
+            exporter_tree: ExporterTree::new(secrets_producer.derive(b"application_export").await?),
         };
 
         let key_schedule = Self {
@@ -644,6 +653,39 @@ mod tests {
         length: usize,
         #[serde(with = "hex::serde")]
         secret: Vec<u8>,
+    }
+
+    // Pins the full derivation from a fixed epoch_secret through the
+    // "application_export" root label down to a leaf of the exporter tree
+    // (draft-ietf-mls-extensions-08 Section 4.4) on cipher suite 1. Member
+    // agreement tests cannot catch a wrong label (all members would agree on
+    // the same wrong value), so the label is frozen here.
+    #[cfg(feature = "safe_extensions")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn application_export_secret_known_answer() {
+        let Some(cs) = try_test_cipher_suite_provider(1) else {
+            return;
+        };
+
+        let epoch_secret = [42u8; 32];
+
+        let res = KeySchedule::from_epoch_secret(
+            &cs,
+            &epoch_secret,
+            #[cfg(any(feature = "secret_tree_access", feature = "private_message"))]
+            32,
+        )
+        .await
+        .unwrap();
+
+        let mut exporter_tree = res.epoch_secrets.exporter_tree;
+
+        let exported = exporter_tree.safe_export_secret(&cs, 0).await.unwrap();
+
+        assert_eq!(
+            hex::encode(&*exported),
+            "e3f6a68ab2fc8e48033a5c3588a5f31f77de464674a0636a935a74064a9ac170"
+        );
     }
 
     #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]

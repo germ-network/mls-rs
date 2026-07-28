@@ -26,6 +26,9 @@ use mls_rs_core::error::IntoAnyError;
 pub(crate) mod resolver;
 pub(crate) mod secret;
 
+#[cfg(feature = "safe_extensions")]
+use crate::group::component_operation::ComponentID;
+
 pub use mls_rs_core::psk::{ExternalPskId, PreSharedKey};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord, MlsSize, MlsEncode, MlsDecode)]
@@ -57,6 +60,92 @@ impl PreSharedKeyID {
 pub(crate) enum JustPreSharedKeyID {
     External(ExternalPskId) = 1u8,
     Resumption(ResumptionPsk) = 2u8,
+    #[cfg(feature = "safe_extensions")]
+    Application(ApplicationPsk) = 3u8,
+}
+
+/// A pre-shared key identifier with `psk_type = application(3)` as defined in
+/// draft-ietf-mls-extensions-08 Section 4.5:
+///
+/// ```text
+/// struct {
+///   PSKType psktype;
+///   select (PreSharedKeyID.psktype) {
+///     ...
+///     case application:
+///       ComponentID component_id;
+///       opaque psk_id<V>;
+///   };
+///   opaque psk_nonce<V>;
+/// } PreSharedKeyID;
+/// ```
+///
+/// Application PSKs provide domain separation between pre-shared keys used by
+/// the core MLS protocol and those used by application components, and
+/// between different components.
+#[cfg(feature = "safe_extensions")]
+#[derive(Clone, Eq, Hash, Ord, PartialOrd, PartialEq, MlsSize, MlsEncode, MlsDecode)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ApplicationPsk {
+    pub(crate) component_id: ComponentID,
+    #[mls_codec(with = "mls_rs_codec::byte_vec")]
+    #[cfg_attr(feature = "serde", serde(with = "mls_rs_core::vec_serde"))]
+    pub(crate) psk_id: Vec<u8>,
+}
+
+#[cfg(feature = "safe_extensions")]
+impl Debug for ApplicationPsk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApplicationPsk")
+            .field("component_id", &self.component_id)
+            .field(
+                "psk_id",
+                &mls_rs_core::debug::pretty_bytes(&self.psk_id).named("psk_id"),
+            )
+            .finish()
+    }
+}
+
+#[cfg(feature = "safe_extensions")]
+impl ApplicationPsk {
+    pub fn new(component_id: ComponentID, psk_id: Vec<u8>) -> Self {
+        Self {
+            component_id,
+            psk_id,
+        }
+    }
+
+    pub fn component_id(&self) -> ComponentID {
+        self.component_id
+    }
+
+    pub fn psk_id(&self) -> &[u8] {
+        &self.psk_id
+    }
+
+    /// The key under which the PSK value for this identifier is looked up in
+    /// the group's [`PreSharedKeyStorage`](mls_rs_core::psk::PreSharedKeyStorage).
+    ///
+    /// The key is the MLS serialization of the `psktype` and the type-specific
+    /// fields of the `PreSharedKeyID` (without the `psk_nonce`), i.e.
+    /// `0x03 || component_id || psk_id<V>`, so it is component-bound and
+    /// cannot collide with the storage key of a different application PSK.
+    /// Every member must insert the PSK value under this key before
+    /// committing or processing a commit that references this identifier.
+    ///
+    /// Note that these keys live in the same [`ExternalPskId`] namespace as
+    /// the identifiers of genuine external PSKs; an application that also
+    /// uses external PSKs should avoid ids that start with the byte `0x03`
+    /// (or otherwise ensure they cannot equal a serialized application PSK
+    /// identifier). The MLS key schedule itself stays domain-separated
+    /// either way, since it binds the full typed `PreSharedKeyID`.
+    pub fn storage_id(&self) -> Result<ExternalPskId, MlsError> {
+        JustPreSharedKeyID::Application(self.clone())
+            .mls_encode_to_vec()
+            .map(ExternalPskId::new)
+            .map_err(Into::into)
+    }
 }
 
 #[derive(Clone, Eq, Hash, Ord, PartialOrd, PartialEq, MlsSize, MlsEncode, MlsDecode)]
@@ -197,5 +286,93 @@ mod tests {
             });
 
         assert!(good);
+    }
+
+    mod codec {
+        use alloc::vec;
+        use alloc::vec::Vec;
+        use mls_rs_codec::{MlsDecode, MlsEncode};
+        use mls_rs_core::psk::ExternalPskId;
+
+        use crate::psk::{
+            JustPreSharedKeyID, PreSharedKeyID, PskGroupId, PskNonce, ResumptionPSKUsage,
+            ResumptionPsk,
+        };
+
+        #[cfg(feature = "safe_extensions")]
+        use crate::psk::ApplicationPsk;
+
+        #[cfg(target_arch = "wasm32")]
+        use wasm_bindgen_test::wasm_bindgen_test as test;
+
+        fn round_trip(id: &PreSharedKeyID) -> Vec<u8> {
+            let encoded = id.mls_encode_to_vec().unwrap();
+            let decoded = PreSharedKeyID::mls_decode(&mut &*encoded).unwrap();
+            assert_eq!(id, &decoded);
+            encoded
+        }
+
+        // The external and resumption variants of PreSharedKeyID must stay
+        // byte-identical to RFC 9420 Section 8.4.
+        #[test]
+        fn external_psk_id_wire_format() {
+            let id = PreSharedKeyID {
+                key_id: JustPreSharedKeyID::External(ExternalPskId::new(vec![7, 8])),
+                psk_nonce: PskNonce(vec![0xAA, 0xBB, 0xCC]),
+            };
+
+            let expected = [1u8, 2, 7, 8, 3, 0xAA, 0xBB, 0xCC];
+
+            assert_eq!(round_trip(&id), expected);
+        }
+
+        #[test]
+        fn resumption_psk_id_wire_format() {
+            let id = PreSharedKeyID {
+                key_id: JustPreSharedKeyID::Resumption(ResumptionPsk {
+                    usage: ResumptionPSKUsage::Application,
+                    psk_group_id: PskGroupId(vec![9]),
+                    psk_epoch: 5,
+                }),
+                psk_nonce: PskNonce(vec![0xAA, 0xBB]),
+            };
+
+            let expected = [1u8 + 1, 1, 1, 9, 0, 0, 0, 0, 0, 0, 0, 5, 2, 0xAA, 0xBB];
+
+            assert_eq!(round_trip(&id), expected);
+        }
+
+        // psk_type = application(3) from draft-ietf-mls-extensions-08
+        // Section 4.5, with the uint32 ComponentID of that draft revision.
+        #[cfg(feature = "safe_extensions")]
+        #[test]
+        fn application_psk_id_wire_format() {
+            let id = PreSharedKeyID {
+                key_id: JustPreSharedKeyID::Application(ApplicationPsk::new(
+                    0x01020304,
+                    vec![7, 8, 9],
+                )),
+                psk_nonce: PskNonce(vec![0xAA, 0xBB]),
+            };
+
+            let expected = [3u8, 1, 2, 3, 4, 3, 7, 8, 9, 2, 0xAA, 0xBB];
+
+            assert_eq!(round_trip(&id), expected);
+        }
+
+        // The storage key is the serialized psktype and type-specific fields,
+        // without the nonce.
+        #[cfg(feature = "safe_extensions")]
+        #[test]
+        fn application_psk_storage_id() {
+            let psk = ApplicationPsk::new(0x01020304, vec![7, 8, 9]);
+
+            let expected = [3u8, 1, 2, 3, 4, 3, 7, 8, 9];
+
+            assert_eq!(
+                psk.storage_id().unwrap(),
+                ExternalPskId::new(expected.to_vec())
+            );
+        }
     }
 }
