@@ -369,6 +369,11 @@ pub enum MlsError {
         error("Exported secret for this component was already consumed in this epoch")
     )]
     ComponentSecretConsumed,
+    #[cfg_attr(
+        feature = "std",
+        error("Attachment object id must be between 1 and 255 bytes")
+    )]
+    InvalidObjectId,
 }
 
 impl IntoAnyError for MlsError {
