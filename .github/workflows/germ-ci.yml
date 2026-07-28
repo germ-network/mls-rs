@@ -1,0 +1,335 @@
+# Fork CI for germ-network/mls-rs.
+#
+# The upstream workflows do not run here: Actions is disabled on this fork, and
+# several of them cannot work outside awslabs anyway — `benchmarks_merge` assumes
+# an AWS IAM role in awslabs' account, `pr-notifier` needs their Slack webhook,
+# and the coverage step needs their Codecov token.
+#
+# Nothing below needs a credential. Two packages are excluded throughout:
+#
+#   mls-rs-crypto-awslc  builds aws-lc from source, which drags in go, ninja,
+#                        nasm and bindgen-cli. Upstream already excludes it from
+#                        its own each-feature run. Not used by TwoMLSPQ.
+#   harness_client       the interop harness; needs protoc.
+#   mls-rs-uniffi        its scenario tests shell out to Maven, Kotlin and
+#                        Python. TwoMLSPQ ships its own uniffi layer over mls-rs
+#                        and does not consume this crate, so the toolchain cost
+#                        buys nothing. (uniffi-bindgen is its helper binary.)
+#
+# mls-rs-crypto-cryptokit stays in: its build.rs is a no-op off Apple, so it is
+# a trivial build on Linux and a real one on macOS, which is the target that
+# matters for TwoMLSPQ.
+name: Germ CI
+
+on:
+  push:
+    branches: [germ-integration]
+  pull_request:
+  # Lets the suite be pointed at a frozen release pin (or any other ref) without
+  # moving it — pushing a workflow file to a pin would defeat the point.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Ref to test (defaults to the branch this is run from)"
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  EXCLUDES: >-
+    --exclude mls-rs-crypto-awslc
+    --exclude harness_client
+    --exclude mls-rs-uniffi
+    --exclude uniffi-bindgen
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-26 for Xcode 26 / Swift 6.2: mls-rs-crypto-cryptokit's
+        # cryptokit-bridge Package.swift declares `swift-tools-version: 6.2`,
+        # and macos-14 (Xcode 15.4, Swift 5.10) cannot build it —
+        #   error: package 'cryptokit-bridge' is using Swift tools version
+        #          6.2.0 but the installed version is 5.10.0
+        # This is the runner that exercises the provider TwoMLSPQ ships on
+        # Apple platforms, so it has to be able to build the Swift side.
+        os: [ubuntu-latest, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Report Swift toolchain
+        if: runner.os == 'macOS'
+        run: swift --version
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ''
+      - uses: Swatinem/rust-cache@v2
+      - name: Detect safe_extensions
+        id: feat
+        run: |
+          if grep -qE '^safe_extensions[[:space:]]*=' mls-rs/Cargo.toml; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::safe_extensions is not defined on this ref;           feature-specific steps skipped"
+          fi
+
+      - name: Default features
+        run: cargo test --workspace ${{ env.EXCLUDES }}
+
+      - name: safe_extensions
+        if: steps.feat.outputs.present == 'true'
+        run: cargo test -p mls-rs --features safe_extensions
+
+      # The exact set TwoMLSPQ builds against, so a break shows up here first.
+      - name: TwoMLSPQ feature set
+        if: steps.feat.outputs.present == 'true'
+        run: cargo test -p mls-rs --features psk,private_message,serde,safe_extensions
+
+      - name: All features
+        run: cargo test --all-features --workspace ${{ env.EXCLUDES }}
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          # The action defaults RUSTFLAGS to `-D warnings`, which promotes
+          # pre-existing upstream warnings (unused imports in mls-rs and
+          # mls-rs-identity-x509) into build errors. Upstream's own workflows
+          # clear it the same way; the lint job still passes -D warnings to
+          # clippy explicitly, which is where we actually want it.
+          rustflags: ''
+      - uses: Swatinem/rust-cache@v2
+      - name: Detect safe_extensions
+        id: feat
+        run: |
+          if grep -qE '^safe_extensions[[:space:]]*=' mls-rs/Cargo.toml; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::safe_extensions is not defined on this ref;           feature-specific steps skipped"
+          fi
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (default)
+        run: cargo clippy --all-targets --workspace ${{ env.EXCLUDES }} -- -D warnings
+
+      - name: Clippy (safe_extensions)
+        if: steps.feat.outputs.present == 'true'
+        run: cargo clippy --all-targets -p mls-rs --features safe_extensions -- -D warnings
+
+      - name: Clippy (no_std)
+        run: cargo clippy --no-default-features -p mls-rs -- -D warnings
+
+  features:
+    name: each-feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ''
+      - uses: Swatinem/rust-cache@v2
+      - name: Detect safe_extensions
+        id: feat
+        run: |
+          if grep -qE '^safe_extensions[[:space:]]*=' mls-rs/Cargo.toml; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::safe_extensions is not defined on this ref;           feature-specific steps skipped"
+          fi
+      - uses: taiki-e/install-action@cargo-hack
+
+      # Catches cfg gates that only break in an odd feature combination —
+      # the failure mode the safe_extensions work is most exposed to.
+      - name: Build each feature in isolation
+        run: cargo hack build --each-feature --workspace ${{ env.EXCLUDES }}
+
+      - name: no-default-features tests
+        run: cargo test --no-default-features --features test_util -p mls-rs --lib --test '*'
+
+      - name: no-default-features tests (safe_extensions)
+        if: steps.feat.outputs.present == 'true'
+        run: cargo test --no-default-features --features rfc_compliant,safe_extensions,test_util -p mls-rs --lib
+
+  async:
+    name: mls_build_async
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          rustflags: ''
+      - uses: Swatinem/rust-cache@v2
+      - name: Detect safe_extensions
+        id: feat
+        run: |
+          if grep -qE '^safe_extensions[[:space:]]*=' mls-rs/Cargo.toml; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::safe_extensions is not defined on this ref;           feature-specific steps skipped"
+          fi
+
+      - name: Async tests
+        env:
+          RUSTFLAGS: --cfg mls_build_async
+        run: cargo test -p mls-rs --lib --test '*' --features test_util
+
+      - name: Async tests (safe_extensions)
+        if: steps.feat.outputs.present == 'true'
+        env:
+          RUSTFLAGS: --cfg mls_build_async
+        run: cargo test -p mls-rs --lib --test '*' --features test_util,safe_extensions
+
+  embedded:
+    name: no_std target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: nightly
+          target: thumbv6m-none-eabi
+          rustflags: ''
+      - uses: Swatinem/rust-cache@v2
+      - name: Detect safe_extensions
+        id: feat
+        run: |
+          if grep -qE '^safe_extensions[[:space:]]*=' mls-rs/Cargo.toml; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::safe_extensions is not defined on this ref;           feature-specific steps skipped"
+          fi
+
+      - name: Build for thumbv6m-none-eabi
+        run: |
+          cargo build -p mls-rs --lib --no-default-features --target thumbv6m-none-eabi
+          cargo build -p mls-rs --lib --no-default-features --features rfc_compliant --target thumbv6m-none-eabi
+
+      - name: Build for thumbv6m-none-eabi (safe_extensions)
+        if: steps.feat.outputs.present == 'true'
+        run: cargo build -p mls-rs --lib --no-default-features --features rfc_compliant,safe_extensions --target thumbv6m-none-eabi
+
+  # ---------------------------------------------------------------------------
+  # Folded in from upstream workflows that are disabled on this fork. They were
+  # verified to pass here before being disabled, and they need no credentials —
+  # keeping them as jobs here means one workflow to reason about, and leaves the
+  # upstream files untouched so they keep resyncing cleanly.
+  # ---------------------------------------------------------------------------
+
+  audit:
+    name: security audit
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions-rust-lang/audit@v1
+        name: Audit Rust dependencies
+
+  wasm:
+    # Slow, and the push trigger only ever fires on germ-integration, whose
+    # content has already been through a PR. Still available via dispatch.
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    env:
+      WASM_BINDGEN_TEST_TIMEOUT: 2000
+      RUSTFLAGS: --cfg mls_build_async
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ''
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: mls-rs (lib)
+        working-directory: mls-rs
+        run: wasm-pack test --headless --chrome --release --lib --features test_util
+      # Upstream also runs `--test '*'` here. It does not survive a GitHub
+      # runner: client_tests exceeds ChromeDriver's 30s renderer timeout, the
+      # driver is SIGKILLed, and wasm-bindgen then fails to parse the truncated
+      # response — surfacing as the misleading `Error: missing field 'chunk'`.
+      # That timeout is ChromeDriver's own and is not raised by
+      # WASM_BINDGEN_TEST_TIMEOUT. Not a code failure: the 395 lib tests above
+      # pass on the same target. Re-enable if the suite is split or the runner
+      # gets faster.
+      - name: mls-rs-crypto-rustcrypto
+        working-directory: mls-rs-crypto-rustcrypto
+        run: wasm-pack test --headless --chrome --release --features browser
+      - name: mls-rs-crypto-webcrypto
+        working-directory: mls-rs-crypto-webcrypto
+        run: wasm-pack test --headless --chrome --release
+      - name: mls-rs-identity-x509
+        working-directory: mls-rs-identity-x509
+        run: wasm-pack test --headless --chrome --release
+
+  fuzz:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    env:
+      RUNS: 10000
+      TIME: 300
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable, nightly
+          components: clippy, rustfmt
+          rustflags: ''
+      - uses: Swatinem/rust-cache@v2
+      - name: Detect safe_extensions
+        id: feat
+        run: |
+          if grep -qE '^safe_extensions[[:space:]]*=' mls-rs/Cargo.toml; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::safe_extensions is not defined on this ref;           feature-specific steps skipped"
+          fi
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Format and lint fuzz targets
+        working-directory: mls-rs/fuzz
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features --workspace -- -D warnings
+      - name: Run fuzz targets
+        working-directory: mls-rs
+        run: |
+          cargo +nightly fuzz run application_data -- -runs=$RUNS -timeout=$TIME
+          cargo +nightly fuzz run cipher_text -- -runs=$RUNS -timeout=$TIME
+          cargo +nightly fuzz run deserialize -- -runs=$RUNS -timeout=$TIME
+          cargo +nightly fuzz run export_secret -- -runs=$RUNS -timeout=$TIME
+          cargo +nightly fuzz run mls_message -- -runs=$RUNS -timeout=$TIME
+          cargo +nightly fuzz run process_bytes -- -runs=$RUNS -timeout=$TIME
