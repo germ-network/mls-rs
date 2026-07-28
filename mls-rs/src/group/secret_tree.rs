@@ -211,27 +211,38 @@ impl<T: TreeIndex> SecretTree<T> {
         Ok(())
     }
 
+    /// Take the node at the leaf `leaf_index`, deriving it first if needed by
+    /// consuming its remaining ancestors from the root down (RFC 9420
+    /// Section 9.2 deletion schedule). Returns `None` if the leaf was already
+    /// consumed.
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    async fn take_leaf_node<P: CipherSuiteProvider>(
+        &mut self,
+        cipher_suite: &P,
+        leaf_index: &T,
+    ) -> Result<Option<SecretTreeNode>, MlsError> {
+        if let Some(node) = self.known_secrets.take_node(leaf_index) {
+            return Ok(Some(node));
+        }
+
+        // Start at the root node and work your way down consuming any intermediates needed
+        for i in leaf_index.direct_copath(&self.leaf_count).into_iter().rev() {
+            self.consume_node(cipher_suite, &i.path).await?;
+        }
+
+        Ok(self.known_secrets.take_node(leaf_index))
+    }
+
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     async fn take_leaf_ratchet<P: CipherSuiteProvider>(
         &mut self,
         cipher_suite: &P,
         leaf_index: &T,
     ) -> Result<SecretRatchets, MlsError> {
-        let node_index = leaf_index;
-
-        let node = match self.known_secrets.take_node(node_index) {
-            Some(node) => node,
-            None => {
-                // Start at the root node and work your way down consuming any intermediates needed
-                for i in node_index.direct_copath(&self.leaf_count).into_iter().rev() {
-                    self.consume_node(cipher_suite, &i.path).await?;
-                }
-
-                self.known_secrets
-                    .take_node(node_index)
-                    .ok_or(MlsError::InvalidLeafConsumption)?
-            }
-        };
+        let node = self
+            .take_leaf_node(cipher_suite, leaf_index)
+            .await?
+            .ok_or(MlsError::InvalidLeafConsumption)?;
 
         Ok(match node {
             SecretTreeNode::Ratchet(ratchet) => ratchet,
@@ -241,6 +252,32 @@ impl<T: TreeIndex> SecretTree<T> {
                 handshake: SecretKeyRatchet::new(cipher_suite, &secret, KeyType::Handshake).await?,
             },
         })
+    }
+
+    /// Take the `tree_node_secret` at the leaf node `leaf_index`, consuming it.
+    ///
+    /// Any intermediate node secrets on the path from the root to the leaf are
+    /// deleted as soon as their children are derived, and the leaf secret
+    /// itself is deleted upon being returned, following the deletion schedule
+    /// in RFC 9420 Section 9.2. Requesting the same leaf twice is an error.
+    #[cfg(feature = "safe_extensions")]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub(crate) async fn take_leaf_secret<P: CipherSuiteProvider>(
+        &mut self,
+        cipher_suite_provider: &P,
+        leaf_index: T,
+    ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        // An empty tree (e.g. the placeholder state used while building an
+        // external commit) has no root secret to consume.
+        if self.leaf_count == T::zero() {
+            return Err(MlsError::ComponentSecretConsumed);
+        }
+
+        self.take_leaf_node(cipher_suite_provider, &leaf_index)
+            .await?
+            .and_then(SecretTreeNode::into_secret)
+            .map(|secret| secret.0)
+            .ok_or(MlsError::ComponentSecretConsumed)
     }
 
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
