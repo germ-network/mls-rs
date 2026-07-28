@@ -134,7 +134,7 @@ where
             .transpose()
     }
 
-    #[cfg(feature = "private_message")]
+    #[cfg(any(feature = "private_message", feature = "safe_extensions"))]
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     pub async fn get_epoch_mut(
         &mut self,

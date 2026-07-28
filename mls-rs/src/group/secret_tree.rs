@@ -35,6 +35,15 @@ impl SecretTreeNode {
             None
         }
     }
+
+    #[cfg(feature = "safe_extensions")]
+    fn as_secret(&self) -> Option<&TreeSecret> {
+        if let SecretTreeNode::Secret(secret) = self {
+            Some(secret)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, MlsEncode, MlsDecode, MlsSize)]
@@ -96,6 +105,11 @@ impl<T: TreeIndex> TreeSecretsVec<T> {
 
     fn take_node(&mut self, index: &T) -> Option<SecretTreeNode> {
         self.inner.remove(index)
+    }
+
+    #[cfg(feature = "safe_extensions")]
+    fn get_node(&self, index: &T) -> Option<&SecretTreeNode> {
+        self.inner.get(index)
     }
 }
 
@@ -278,6 +292,63 @@ impl<T: TreeIndex> SecretTree<T> {
             .and_then(SecretTreeNode::into_secret)
             .map(|secret| secret.0)
             .ok_or(MlsError::ComponentSecretConsumed)
+    }
+
+    /// Derive the `tree_node_secret` at the leaf node `leaf_index` without
+    /// consuming anything.
+    ///
+    /// Unlike [`SecretTree::take_leaf_secret`] this leaves the tree untouched:
+    /// intermediate secrets are derived in memory and dropped, so the same leaf
+    /// stays derivable for as long as one of its ancestors is retained. Fails
+    /// with [`MlsError::ComponentSecretConsumed`] once every node on the path
+    /// from the root to the leaf has been deleted.
+    #[cfg(feature = "safe_extensions")]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub(crate) async fn peek_leaf_secret<P: CipherSuiteProvider>(
+        &self,
+        cipher_suite_provider: &P,
+        leaf_index: T,
+    ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        if self.leaf_count == T::zero() {
+            return Err(MlsError::ComponentSecretConsumed);
+        }
+
+        // `direct_copath` yields ancestors leaf-side first and excludes the
+        // node itself, so reversing it and appending the leaf gives the full
+        // root-to-leaf descent.
+        let mut descent = leaf_index
+            .direct_copath(&self.leaf_count)
+            .into_iter()
+            .rev()
+            .map(|node| node.path)
+            .collect::<Vec<_>>();
+
+        descent.push(leaf_index);
+
+        let (start, mut secret) = descent
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, index)| {
+                self.known_secrets
+                    .get_node(index)
+                    .and_then(SecretTreeNode::as_secret)
+                    .map(|secret| (i, secret.0.clone()))
+            })
+            .ok_or(MlsError::ComponentSecretConsumed)?;
+
+        for window in descent[start..].windows(2) {
+            let label: &[u8] = if window[0].left().as_ref() == Some(&window[1]) {
+                b"left"
+            } else {
+                b"right"
+            };
+
+            secret =
+                kdf_expand_with_label(cipher_suite_provider, &secret, b"tree", label, None).await?;
+        }
+
+        Ok(secret)
     }
 
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]

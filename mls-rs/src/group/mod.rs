@@ -169,6 +169,9 @@ pub use secret_tree::MessageKeyData as MessageKey;
 #[cfg(feature = "safe_extensions")]
 pub(crate) mod exporter_tree;
 
+#[cfg(feature = "safe_extensions")]
+pub(crate) mod attachment;
+
 #[cfg(all(test, feature = "rfc_compliant"))]
 mod interop_test_vectors;
 
@@ -1909,6 +1912,110 @@ where
             .map(Into::into)
     }
 
+    /// Content encryption key for an attachment, per
+    /// draft-sullivan-mls-attachments:
+    ///
+    /// ```text
+    /// CEK = ExpandWithLabel(SafeExportSecret(component_id),
+    ///                       ComponentOperationLabel(component_id, "attachment"),
+    ///                       object_id, 32)
+    /// ```
+    ///
+    /// mls-rs derives the key only; SEAL encryption itself belongs to the
+    /// calling application, which takes the raw 32 bytes.
+    ///
+    /// Unlike [`Group::safe_export_secret`] this does **not** consume the
+    /// component's exporter secret: an attachment reference can arrive long
+    /// after the epoch that produced it, so the same CEK must stay derivable
+    /// from stored group state for as long as the epoch is retained. A
+    /// component should therefore use either this or `safe_export_secret`, not
+    /// both. [`Group::delete_component_secret`] ends the window early.
+    ///
+    /// `object_id` must be between 1 and 255 bytes, and `component_id` less
+    /// than 2^16. IANA has not assigned a component id for attachment
+    /// encryption, so applications should pin a private-use value
+    /// (0x8000–0xFFFF); changing it changes every derived key.
+    #[cfg(feature = "safe_extensions")]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub async fn attachment_cek(
+        &self,
+        component_id: ComponentID,
+        object_id: &[u8],
+    ) -> Result<Secret, MlsError> {
+        let component_secret = self
+            .epoch_secrets
+            .exporter_tree
+            .peek_export_secret(&self.cipher_suite_provider, component_id)
+            .await?;
+
+        attachment::attachment_cek(
+            &self.cipher_suite_provider,
+            &component_secret,
+            component_id,
+            object_id,
+        )
+        .await
+        .map(Into::into)
+    }
+
+    /// [`Group::attachment_cek`] against a prior epoch of this group, for
+    /// references that arrive after the group has advanced.
+    ///
+    /// Limited to the epochs the group's [`GroupStateStorage`] still retains;
+    /// fails with [`MlsError::EpochNotFound`] otherwise.
+    #[cfg(all(feature = "safe_extensions", feature = "prior_epoch"))]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub async fn attachment_cek_at_epoch(
+        &mut self,
+        epoch_id: u64,
+        component_id: ComponentID,
+        object_id: &[u8],
+    ) -> Result<Secret, MlsError> {
+        if epoch_id == self.context().epoch {
+            return self.attachment_cek(component_id, object_id).await;
+        }
+
+        let epoch = self
+            .state_repo
+            .get_epoch_mut(epoch_id)
+            .await?
+            .ok_or(MlsError::EpochNotFound)?;
+
+        let component_secret = epoch
+            .secrets
+            .exporter_tree
+            .peek_export_secret(&self.cipher_suite_provider, component_id)
+            .await?;
+
+        attachment::attachment_cek(
+            &self.cipher_suite_provider,
+            &component_secret,
+            component_id,
+            object_id,
+        )
+        .await
+        .map(Into::into)
+    }
+
+    /// Delete a component's exporter secret for the current epoch, so that no
+    /// further secrets — including attachment CEKs — can be derived for it
+    /// until the group advances.
+    ///
+    /// Provides explicit forward secrecy for components that use
+    /// [`Group::attachment_cek`], which otherwise retains the secret for the
+    /// epoch's lifetime. Other components are unaffected. Idempotent.
+    #[cfg(feature = "safe_extensions")]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub async fn delete_component_secret(
+        &mut self,
+        component_id: ComponentID,
+    ) -> Result<(), MlsError> {
+        self.epoch_secrets
+            .exporter_tree
+            .delete_component_secret(&self.cipher_suite_provider, component_id)
+            .await
+    }
+
     /// `DeriveSecret(secret, label)` from RFC 9420 Section 8, using this
     /// group's cipher suite.
     ///
@@ -2215,16 +2322,15 @@ impl<C: ClientConfig> Group<C> {
             .map(|l| l.map(|n| n.signing_identity.signature_key.clone()))
             .collect();
 
+        // The exporter tree is archived as-is, so that components which derive
+        // rather than consume — see [`Group::attachment_cek`], whose object
+        // references can arrive after the group has advanced — stay derivable
+        // for as long as the epoch is retained. Anything already consumed in
+        // this epoch was deleted from the tree at that point and stays gone.
+        //
+        // This retains no more than the epoch already does: `secret_tree` in
+        // the same struct yields every application message key for the epoch.
         let secrets = self.epoch_secrets.clone();
-
-        // The exporter tree can only be read while its epoch is current, so
-        // retaining it in a prior epoch would keep deletable key material
-        // alive with no reader (RFC 9420 Section 9.2).
-        #[cfg(feature = "safe_extensions")]
-        let secrets = EpochSecrets {
-            exporter_tree: exporter_tree::ExporterTree::empty(),
-            ..secrets
-        };
 
         let past_epoch = PriorEpoch {
             context: self.context().clone(),
@@ -7118,6 +7224,250 @@ mod tests {
 
         let next_epoch_export = alice.group.safe_export_secret(component_a).await.unwrap();
         assert_ne!(next_epoch_export, alice_export);
+    }
+
+    #[cfg(feature = "safe_extensions")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn attachment_cek_agrees_between_members_and_is_repeatable() {
+        let mut alice = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+        let (bob, _) = alice.join("bob").await;
+
+        let component = 0x8001;
+
+        let alice_cek = alice
+            .group
+            .attachment_cek(component, b"object-a")
+            .await
+            .unwrap();
+
+        let bob_cek = bob
+            .group
+            .attachment_cek(component, b"object-a")
+            .await
+            .unwrap();
+
+        assert_eq!(alice_cek, bob_cek);
+        assert_eq!(alice_cek.as_bytes().len(), 32);
+
+        // Unlike safe_export_secret, deriving does not consume: the same CEK
+        // stays derivable so late-arriving references still resolve.
+        let again = alice
+            .group
+            .attachment_cek(component, b"object-a")
+            .await
+            .unwrap();
+
+        assert_eq!(alice_cek, again);
+
+        // Distinct objects and components are independent.
+        let other_object = alice
+            .group
+            .attachment_cek(component, b"object-b")
+            .await
+            .unwrap();
+
+        let other_component = alice
+            .group
+            .attachment_cek(component + 1, b"object-a")
+            .await
+            .unwrap();
+
+        assert_ne!(alice_cek, other_object);
+        assert_ne!(alice_cek, other_component);
+    }
+
+    #[cfg(feature = "safe_extensions")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn attachment_cek_survives_other_component_consumption() {
+        let mut alice = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+
+        let attachments = 0x8001;
+
+        let before = alice
+            .group
+            .attachment_cek(attachments, b"object")
+            .await
+            .unwrap();
+
+        // Consuming exports walk the same tree and delete their path, but
+        // derive both children first, so sibling subtrees survive.
+        for component in [0x0001, 0xFFFF, attachments ^ 0x0001] {
+            alice.group.safe_export_secret(component).await.unwrap();
+        }
+
+        let after = alice
+            .group
+            .attachment_cek(attachments, b"object")
+            .await
+            .unwrap();
+
+        assert_eq!(before, after);
+    }
+
+    #[cfg(feature = "safe_extensions")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn attachment_cek_can_be_deleted_for_forward_secrecy() {
+        let mut alice = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+
+        let component = 0x8001;
+        let other = 0x8002;
+
+        alice
+            .group
+            .attachment_cek(component, b"object")
+            .await
+            .unwrap();
+
+        alice
+            .group
+            .delete_component_secret(component)
+            .await
+            .unwrap();
+
+        let res = alice.group.attachment_cek(component, b"object").await;
+        assert_matches!(res, Err(MlsError::ComponentSecretConsumed));
+
+        // Idempotent, and scoped to the one component.
+        alice
+            .group
+            .delete_component_secret(component)
+            .await
+            .unwrap();
+
+        let other_res = alice.group.attachment_cek(other, b"object").await;
+        assert!(other_res.is_ok());
+
+        // A new epoch restores derivability with a fresh value.
+        alice.group.commit(vec![]).await.unwrap();
+        alice.process_pending_commit().await.unwrap();
+
+        let next_epoch = alice.group.attachment_cek(component, b"object").await;
+        assert!(next_epoch.is_ok());
+    }
+
+    #[cfg(feature = "safe_extensions")]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn attachment_cek_survives_snapshot_round_trip() {
+        use mls_rs_codec::{MlsDecode, MlsEncode};
+
+        let alice = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+
+        let component = 0x8001;
+
+        let before = alice
+            .group
+            .attachment_cek(component, b"object")
+            .await
+            .unwrap();
+
+        // Through the real persistence path: the CEK must survive being
+        // serialized to storage bytes and read back.
+        let bytes = alice.group.snapshot().unwrap().mls_encode_to_vec().unwrap();
+        let snapshot = snapshot::Snapshot::mls_decode(&mut &*bytes).unwrap();
+
+        let restored = Group::from_snapshot(alice.group.config.clone(), snapshot)
+            .await
+            .unwrap();
+
+        let after = restored.attachment_cek(component, b"object").await.unwrap();
+
+        assert_eq!(before, after);
+    }
+
+    #[cfg(all(feature = "safe_extensions", feature = "prior_epoch"))]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn attachment_cek_at_epoch_after_group_advances() {
+        let mut alice = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+
+        let component = 0x8001;
+
+        let first_epoch = alice.group.context().epoch;
+
+        let before = alice
+            .group
+            .attachment_cek(component, b"object")
+            .await
+            .unwrap();
+
+        alice.group.commit(vec![]).await.unwrap();
+        alice.process_pending_commit().await.unwrap();
+
+        // The current epoch derives a different key...
+        let current = alice
+            .group
+            .attachment_cek(component, b"object")
+            .await
+            .unwrap();
+
+        assert_ne!(before, current);
+
+        // ...but a reference from the prior epoch still resolves.
+        let at_epoch = alice
+            .group
+            .attachment_cek_at_epoch(first_epoch, component, b"object")
+            .await
+            .unwrap();
+
+        assert_eq!(before, at_epoch);
+
+        // The current epoch is reachable through the same API.
+        let at_current = alice
+            .group
+            .attachment_cek_at_epoch(alice.group.context().epoch, component, b"object")
+            .await
+            .unwrap();
+
+        assert_eq!(current, at_current);
+
+        let res = alice
+            .group
+            .attachment_cek_at_epoch(first_epoch + 100, component, b"object")
+            .await;
+
+        assert_matches!(res, Err(MlsError::EpochNotFound));
+    }
+
+    /// Archiving the exporter tree keeps derivable components derivable, but
+    /// must not resurrect anything the epoch already consumed or deleted.
+    #[cfg(all(feature = "safe_extensions", feature = "prior_epoch"))]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn consumed_components_stay_consumed_in_prior_epochs() {
+        let mut alice = test_group(TEST_PROTOCOL_VERSION, TEST_CIPHER_SUITE).await;
+
+        let consumed = 0x8001;
+        let deleted = 0x8002;
+        let retained = 0x8003;
+
+        let first_epoch = alice.group.context().epoch;
+
+        alice.group.safe_export_secret(consumed).await.unwrap();
+        alice.group.delete_component_secret(deleted).await.unwrap();
+
+        let before = alice
+            .group
+            .attachment_cek(retained, b"object")
+            .await
+            .unwrap();
+
+        alice.group.commit(vec![]).await.unwrap();
+        alice.process_pending_commit().await.unwrap();
+
+        for component in [consumed, deleted] {
+            let res = alice
+                .group
+                .attachment_cek_at_epoch(first_epoch, component, b"object")
+                .await;
+
+            assert_matches!(res, Err(MlsError::ComponentSecretConsumed));
+        }
+
+        let after = alice
+            .group
+            .attachment_cek_at_epoch(first_epoch, retained, b"object")
+            .await
+            .unwrap();
+
+        assert_eq!(before, after);
     }
 
     #[cfg(feature = "safe_extensions")]
