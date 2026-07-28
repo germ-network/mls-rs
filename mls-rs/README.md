@@ -7,6 +7,13 @@
 [api documentation]: https://docs.rs/mls-rs/badge.svg
 [docs.rs]: https://docs.rs/mls-rs
 
+> **This is [germ-network/mls-rs](https://github.com/germ-network/mls-rs), a fork of
+> [awslabs/mls-rs](https://github.com/awslabs/mls-rs).** `main` mirrors upstream and is
+> fast-forward only; every Germ change lives on its own feature branch rebased on top of
+> it, composed onto `germ-integration`. See [FORK.md](../FORK.md) for the branching
+> model, the feature branches currently in play, and how to recompose after an upstream
+> resync.
+
 <!-- cargo-sync-readme start -->
 
 An implementation of the [IETF Messaging Layer Security](https://messaginglayersecurity.rocks)
