@@ -270,6 +270,19 @@ impl KeySchedule {
 
         Ok(ExternalPubExt { external_pub })
     }
+
+    /// PROTOTYPE (swift-mls export): `exporter_secret` and `init_secret` are
+    /// private to this module; the swift-mls snapshot's `EpochSecrets` (§4.2)
+    /// needs both, so expose them read-only to `group::swift_export`.
+    #[cfg(feature = "swift_export")]
+    pub(crate) fn raw_exporter_secret(&self) -> &Zeroizing<Vec<u8>> {
+        &self.exporter_secret
+    }
+
+    #[cfg(feature = "swift_export")]
+    pub(crate) fn raw_init_secret(&self) -> &Zeroizing<Vec<u8>> {
+        &self.init_secret.0
+    }
 }
 
 #[derive(MlsEncode, MlsSize)]

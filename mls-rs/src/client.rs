@@ -359,6 +359,29 @@ pub enum MlsError {
     DefaultValueListed,
     #[cfg_attr(feature = "std", error("not a subgroup"))]
     NotASubgroup,
+    /// PROTOTYPE (swift-mls export, spec §6.3 "B3"): a pending commit awaiting
+    /// confirmation has no representation in the swift-mls snapshot format, so
+    /// export is refused rather than silently dropping it.
+    #[cfg(feature = "swift_export")]
+    #[cfg_attr(
+        feature = "std",
+        error("group has a pending commit; swift export is not representable until it is applied or cleared")
+    )]
+    SwiftExportPendingCommitUnsupported,
+    /// The group has an outstanding by-reference self-Update whose new leaf
+    /// secret lives only in runtime state (the updater-side handoff), not in
+    /// the snapshot format, so a mid-update export is refused rather than
+    /// dropping a secret the restored session would need to adopt the update.
+    /// Re-export once the update is committed or the epoch advances.
+    #[cfg(feature = "swift_export")]
+    #[cfg_attr(
+        feature = "std",
+        error("group has pending self-updates; swift export is refused mid-update until they are committed or the epoch advances")
+    )]
+    SwiftExportPendingUpdatesUnsupported,
+    #[cfg(feature = "swift_export")]
+    #[cfg_attr(feature = "std", error("failed to encode swift-mls export as CBOR"))]
+    SwiftExportEncodingFailed,
 }
 
 impl IntoAnyError for MlsError {

@@ -306,6 +306,75 @@ impl<T: TreeIndex> SecretTree<T> {
     }
 }
 
+/// PROTOTYPE (swift-mls export, spec §4.3 "secret tree split"): a read-only,
+/// non-mutating digest of every entry mls-rs's secret tree currently holds.
+/// `known_secrets`/`leaf_count` are private to this module, and `SecretTreeNode`
+/// is not exposed outside it, so this shaping happens here rather than in
+/// `group::swift_export`, which only sees the plain data below.
+#[cfg(feature = "swift_export")]
+pub(crate) struct ExportedChain {
+    pub(crate) head_generation: u32,
+    /// Always `Some` for the prototype: mls-rs's live `SecretKeyRatchet` has no
+    /// "retired" representation (§4.3's `head_secret` absent / `head_generation
+    /// == 2^32` case), so this transform never produces one.
+    pub(crate) head_secret: Zeroizing<Vec<u8>>,
+    pub(crate) skipped: Vec<(u32, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>)>,
+}
+
+#[cfg(feature = "swift_export")]
+pub(crate) enum ExportedSecretTreeEntry {
+    Secret(Zeroizing<Vec<u8>>),
+    Ratchet {
+        application: ExportedChain,
+        handshake: ExportedChain,
+    },
+}
+
+#[cfg(feature = "swift_export")]
+impl SecretKeyRatchet {
+    fn export(&self) -> ExportedChain {
+        let mut skipped = Vec::new();
+
+        #[cfg(feature = "out_of_order")]
+        for (generation, key_data) in self.history.iter() {
+            skipped.push((*generation, key_data.key.clone(), key_data.nonce.clone()));
+        }
+
+        ExportedChain {
+            head_generation: self.generation,
+            head_secret: self.secret.0.clone(),
+            skipped,
+        }
+    }
+}
+
+#[cfg(feature = "swift_export")]
+impl<T: TreeIndex> SecretTree<T> {
+    pub(crate) fn leaf_count(&self) -> T {
+        self.leaf_count.clone()
+    }
+
+    pub(crate) fn export_entries(&self) -> Vec<(T, ExportedSecretTreeEntry)> {
+        self.known_secrets
+            .inner
+            .iter()
+            .map(|(index, node)| {
+                let exported = match node {
+                    SecretTreeNode::Secret(secret) => {
+                        ExportedSecretTreeEntry::Secret(secret.0.clone())
+                    }
+                    SecretTreeNode::Ratchet(ratchet) => ExportedSecretTreeEntry::Ratchet {
+                        application: ratchet.application.export(),
+                        handshake: ratchet.handshake.export(),
+                    },
+                };
+
+                (index.clone(), exported)
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum KeyType {
     Handshake,

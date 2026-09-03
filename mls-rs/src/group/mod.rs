@@ -139,6 +139,9 @@ mod roster;
 pub(crate) mod snapshot;
 pub(crate) mod state;
 
+#[cfg(feature = "swift_export")]
+pub(crate) mod swift_export;
+
 #[cfg(feature = "prior_epoch")]
 pub(crate) mod state_repo;
 #[cfg(not(feature = "prior_epoch"))]
