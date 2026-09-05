@@ -172,6 +172,42 @@ where
         .map_err(Into::into)
     }
 
+    /// PROTOTYPE (swift-mls export, GER-2372): a read-only counterpart to
+    /// `get_epoch_mut`, used to enumerate retained prior epochs for
+    /// `Group::export_for_swift`. `export_for_swift` only holds `&Group`, so
+    /// it can't use `get_epoch_mut`'s `&mut self` -- and it shouldn't
+    /// populate the updates-cache side effect that method has anyway, since
+    /// exporting isn't itself a state change worth flushing to storage.
+    #[cfg(feature = "swift_export")]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub(crate) async fn get_epoch(&self, epoch_id: u64) -> Result<Option<PriorEpoch>, MlsError> {
+        // Search the local inserts cache
+        if let Some(min) = self.pending_commit.inserts.front().map(|e| e.epoch_id()) {
+            if epoch_id >= min {
+                return Ok(self
+                    .pending_commit
+                    .inserts
+                    .get((epoch_id - min) as usize)
+                    .cloned());
+            }
+        }
+
+        // Search the local updates cache
+        if let Some(pending) = self.find_pending(epoch_id) {
+            return Ok(Some(self.pending_commit.updates[pending].clone()));
+        }
+
+        // Search the stored cache. Unlike `get_epoch_mut`, a hit here is not
+        // cached into `pending_commit.updates`: this accessor must not
+        // mutate observable state.
+        self.storage
+            .epoch(&self.group_id, epoch_id)
+            .await
+            .map_err(|e| MlsError::GroupStorageError(e.into_any_error()))?
+            .map(|epoch| PriorEpoch::mls_decode(&mut &**epoch).map_err(Into::into))
+            .transpose()
+    }
+
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     pub async fn insert(&mut self, epoch: PriorEpoch) -> Result<(), MlsError> {
         if epoch.group_id() != self.group_id {

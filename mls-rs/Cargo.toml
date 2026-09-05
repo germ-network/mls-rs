@@ -41,7 +41,7 @@ gsma_rcs_e2ee_feature = ["mls-rs-core/gsma_rcs_e2ee_feature"]
 
 # PROTOTYPE: live-state export of a Group's in-memory secrets into the
 # swift-mls snapshot archive format (see swift-mls/spec/snapshot.md).
-swift_export = ["dep:ciborium", "std", "private_message", "psk"]
+swift_export = ["dep:ciborium", "std", "private_message", "psk", "prior_epoch"]
 
 std = ["mls-rs-core/std", "mls-rs-codec/std", "mls-rs-identity-x509?/std", "hex/std", "futures/std", "itertools/use_std", "zeroize/std", "dep:debug_tree", "dep:thiserror", "serde?/std", "subtle/std"]
 
