@@ -20,6 +20,7 @@ use crate::client::MlsError;
 use crate::client_config::ClientConfig;
 use crate::tree_kem::node::NodeIndex;
 
+use super::epoch::EpochSecrets;
 use super::secret_tree::ExportedSecretTreeEntry;
 use super::Group;
 
@@ -245,16 +246,12 @@ where
     C: ClientConfig,
 {
     /// PROTOTYPE: exports this group's live state as a swift-mls snapshot
-    /// archive (CBOR bytes). Scope limits, each a TODO to resolve before
-    /// this is anything but a prototype:
+    /// archive (CBOR bytes). `message_secrets` and `resumption_psks` carry
+    /// every retained prior epoch (`Group.state_repo`) in addition to the
+    /// current one (GER-2372 scope decision B2), and `retention` reflects
+    /// the actual count exported (B1). Remaining scope limits, each a TODO
+    /// to resolve before this is anything but a prototype:
     ///
-    /// - B1 (`retention`): no live source for `resumption_psk_depth` /
-    ///   `message_secrets_depth` -- `GroupStateStorage` doesn't expose a
-    ///   retention window generically. Pinned to 1 (this prototype only
-    ///   ever exports the current epoch anyway).
-    /// - B2 (`resumption_psks`, `message_secrets`): prior epochs live in
-    ///   async storage, not `Group`'s in-memory state. Only the current
-    ///   epoch is exported.
     /// - B3 (`pending_commit`): a pending commit awaiting confirmation has
     ///   no representation in this format, so it's a hard error rather than
     ///   a silent drop.
@@ -269,7 +266,8 @@ where
     /// `pub` (not `pub(crate)`): the dual-write caller is a separate crate
     /// (two-mls-pq), and it also roots the mapping/encoding chain so the
     /// feature build stays warning-clean.
-    pub fn export_for_swift(&self) -> Result<Vec<u8>, MlsError> {
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub async fn export_for_swift(&self) -> Result<Vec<u8>, MlsError> {
         if !self.pending_commit.is_none() {
             return Err(MlsError::SwiftExportPendingCommitUnsupported);
         }
@@ -332,48 +330,17 @@ where
             );
         }
 
-        let leaf_count = self.epoch_secrets.secret_tree.leaf_count();
-        let mut node_secrets = BTreeMap::new();
-        let mut chains = BTreeMap::new();
-        let mut own_next_generation = (0u32, 0u32);
-
-        for (node_index, entry) in self.epoch_secrets.secret_tree.export_entries() {
-            match entry {
-                ExportedSecretTreeEntry::Secret(secret) => {
-                    node_secrets.insert(node_index, secret);
-                }
-                ExportedSecretTreeEntry::Ratchet {
-                    application,
-                    handshake,
-                } => {
-                    if node_index == own_node_index {
-                        own_next_generation =
-                            (handshake.head_generation, application.head_generation);
-                    }
-
-                    let leaf = node_index as u64 / 2;
-                    chains.insert(leaf << 1, exported_chain_to_swift(handshake));
-                    chains.insert((leaf << 1) | 1, exported_chain_to_swift(application));
-                }
-            }
-        }
-
-        let message_secrets_store = SwiftMessageSecretStore {
-            group_context: group_context.clone(),
-            sender_data_secret: Zeroizing::new(
-                self.epoch_secrets.sender_data_secret.as_ref().to_vec(),
-            ),
-            signature_keys,
-            secret_tree: SwiftSecretTreeState {
-                leaf_count,
-                node_secrets,
-            },
-            chains,
-            own_next_generation,
-        };
-
         let mut message_secrets = BTreeMap::new();
-        message_secrets.insert(epoch, message_secrets_store);
+
+        message_secrets.insert(
+            epoch,
+            message_store_from(
+                group_context.clone(),
+                own_node_index,
+                &self.epoch_secrets,
+                signature_keys,
+            ),
+        );
 
         let mut resumption_psks = BTreeMap::new();
 
@@ -382,6 +349,49 @@ where
             epoch,
             Zeroizing::new(self.epoch_secrets.resumption_secret.as_ref().to_vec()),
         );
+
+        // B2: walk every retained prior epoch from `current_epoch - 1`
+        // downward, stopping at the first miss -- there's no fixed
+        // retention depth to assume, so this can't just loop a constant
+        // number of times.
+        let mut prior_epoch_id = epoch;
+
+        while prior_epoch_id > 0 {
+            prior_epoch_id -= 1;
+
+            let Some(prior) = self.state_repo.get_epoch(prior_epoch_id).await? else {
+                break;
+            };
+
+            let prior_context = prior.context.mls_encode_to_vec()?;
+            let prior_own_node_index: NodeIndex = prior.self_index.into();
+
+            let prior_signature_keys = prior
+                .signature_public_keys
+                .iter()
+                .enumerate()
+                .filter_map(|(leaf_index, key)| {
+                    key.as_ref()
+                        .map(|key| (leaf_index as u32, key.as_ref().to_vec()))
+                })
+                .collect();
+
+            message_secrets.insert(
+                prior_epoch_id,
+                message_store_from(
+                    prior_context,
+                    prior_own_node_index,
+                    &prior.secrets,
+                    prior_signature_keys,
+                ),
+            );
+
+            #[cfg(feature = "psk")]
+            resumption_psks.insert(
+                prior_epoch_id,
+                Zeroizing::new(prior.secrets.resumption_secret.as_ref().to_vec()),
+            );
+        }
 
         let archive = SwiftGroupArchive {
             group_context,
@@ -395,17 +405,66 @@ where
                 membership_key: self.key_schedule.membership_key.clone(),
             },
             tree_secret_keys,
-            resumption_psks,
-            message_secrets,
             retention: SwiftRetention {
-                resumption_psk_depth: 1,
-                message_secrets_depth: 1,
+                resumption_psk_depth: resumption_psks.len() as u32,
+                message_secrets_depth: message_secrets.len() as u32,
                 max_forward_jump: super::secret_tree::MAX_RATCHET_BACK_HISTORY,
                 max_skipped_keys_per_sender: super::secret_tree::MAX_RATCHET_BACK_HISTORY,
             },
+            resumption_psks,
+            message_secrets,
         };
 
         archive.to_cbor()
+    }
+}
+
+/// Shared mapping path (§4.3) for both the current epoch (`Group.epoch_secrets`)
+/// and every retained prior epoch (`PriorEpoch.secrets`, same `EpochSecrets`
+/// type) -- so the two never drift apart. `own_node_index` is the exporting
+/// group member's own leaf, converted from that epoch's own `self_index`
+/// (current or historical), used only to pick out `own_next_generation`.
+fn message_store_from(
+    group_context: Vec<u8>,
+    own_node_index: NodeIndex,
+    epoch_secrets: &EpochSecrets,
+    signature_keys: BTreeMap<u32, Vec<u8>>,
+) -> SwiftMessageSecretStore {
+    let leaf_count = epoch_secrets.secret_tree.leaf_count();
+    let mut node_secrets = BTreeMap::new();
+    let mut chains = BTreeMap::new();
+    let mut own_next_generation = (0u32, 0u32);
+
+    for (node_index, entry) in epoch_secrets.secret_tree.export_entries() {
+        match entry {
+            ExportedSecretTreeEntry::Secret(secret) => {
+                node_secrets.insert(node_index, secret);
+            }
+            ExportedSecretTreeEntry::Ratchet {
+                application,
+                handshake,
+            } => {
+                if node_index == own_node_index {
+                    own_next_generation = (handshake.head_generation, application.head_generation);
+                }
+
+                let leaf = node_index as u64 / 2;
+                chains.insert(leaf << 1, exported_chain_to_swift(handshake));
+                chains.insert((leaf << 1) | 1, exported_chain_to_swift(application));
+            }
+        }
+    }
+
+    SwiftMessageSecretStore {
+        group_context,
+        sender_data_secret: Zeroizing::new(epoch_secrets.sender_data_secret.as_ref().to_vec()),
+        signature_keys,
+        secret_tree: SwiftSecretTreeState {
+            leaf_count,
+            node_secrets,
+        },
+        chains,
+        own_next_generation,
     }
 }
 
@@ -436,6 +495,19 @@ mod tests {
         let cipher_suite: CipherSuite = TEST_CIPHER_SUITE;
         let mut groups = test_n_member_group(TEST_PROTOCOL_VERSION, cipher_suite, 2).await;
 
+        // Advance an epoch with an empty commit so the pre-commit epoch
+        // becomes a retained prior epoch (B2) alongside the new current
+        // epoch. (Adding bob already advanced the group once, by way of
+        // `test_n_member_group`'s own commit, so this is the second prior
+        // epoch alice will have on record.)
+        let commit_output = groups[0].commit(vec![]).await.unwrap();
+        groups[0].apply_pending_commit().await.unwrap();
+
+        groups[1]
+            .process_incoming_message(commit_output.commit_message)
+            .await
+            .unwrap();
+
         let msg = groups[1]
             .encrypt_application_message(b"hello", vec![])
             .await
@@ -443,7 +515,9 @@ mod tests {
 
         groups[0].process_incoming_message(msg).await.unwrap();
 
-        let bytes = groups[0].export_for_swift().unwrap();
+        let current_epoch = groups[0].context().epoch;
+
+        let bytes = groups[0].export_for_swift().await.unwrap();
 
         let value: Value = ciborium::from_reader(bytes.as_slice()).unwrap();
         let top = value.into_map().expect("top level is a map");
@@ -465,12 +539,72 @@ mod tests {
         );
 
         let message_secrets = get(8).as_map().expect("message_secrets is a map");
-        assert_eq!(message_secrets.len(), 1, "current epoch only, per B2");
+        assert!(
+            message_secrets.len() > 1,
+            "expected the current epoch plus at least one retained prior epoch, got {}",
+            message_secrets.len()
+        );
 
-        let (_, store) = &message_secrets[0];
-        let store = store.as_map().expect("message secret store is a map");
+        let resumption_psks = get(7).as_map().expect("resumption_psks is a map");
+        assert_eq!(
+            resumption_psks.len(),
+            message_secrets.len(),
+            "every exported epoch should also have a resumption secret"
+        );
 
-        let chains = store
+        for (epoch_key, store) in message_secrets.iter() {
+            let store = store
+                .as_map()
+                .unwrap_or_else(|| panic!("message secret store for {epoch_key:?} is a map"));
+
+            let group_context = store
+                .iter()
+                .find(|(k, _)| k == &Value::from(0u64))
+                .unwrap()
+                .1
+                .as_bytes()
+                .expect("group_context is bytes");
+
+            assert!(
+                !group_context.is_empty(),
+                "group_context for {epoch_key:?} must be populated"
+            );
+
+            let secret_tree = store
+                .iter()
+                .find(|(k, _)| k == &Value::from(3u64))
+                .unwrap()
+                .1
+                .as_map()
+                .expect("secret_tree is a map");
+
+            let node_secrets = secret_tree
+                .iter()
+                .find(|(k, _)| k == &Value::from(1u64))
+                .unwrap()
+                .1
+                .as_map()
+                .expect("node_secrets is a map");
+
+            // Alice and Bob is a 2-leaf tree: consuming Bob's leaf ratchet
+            // also splits the root into the two leaves' Secret entries, so
+            // Alice's own leaf's interior frontier secret should still be
+            // present for every epoch's tree.
+            assert!(
+                !node_secrets.is_empty(),
+                "splitting the tree to reach bob's leaf should leave a node_secrets frontier for {epoch_key:?}"
+            );
+        }
+
+        let current_epoch_store = message_secrets
+            .iter()
+            .find(|(k, _)| k == &Value::from(current_epoch))
+            .expect("current epoch must be present")
+            .1
+            .as_map()
+            .unwrap();
+
+        let chains = current_epoch_store
             .iter()
             .find(|(k, _)| k == &Value::from(4u64))
             .unwrap()
@@ -480,31 +614,44 @@ mod tests {
 
         assert!(
             !chains.is_empty(),
-            "bob's application message must have advanced a chain"
+            "bob's application message must have advanced a chain in the current epoch"
         );
 
-        let secret_tree = store
-            .iter()
-            .find(|(k, _)| k == &Value::from(3u64))
-            .unwrap()
-            .1
-            .as_map()
-            .expect("secret_tree is a map");
+        assert!(
+            message_secrets
+                .iter()
+                .any(|(k, _)| k != &Value::from(current_epoch)),
+            "at least one retained prior epoch must be present"
+        );
 
-        let node_secrets = secret_tree
+        let retention = get(9).as_map().expect("retention is a map");
+
+        let message_secrets_depth = retention
             .iter()
             .find(|(k, _)| k == &Value::from(1u64))
             .unwrap()
             .1
-            .as_map()
-            .expect("node_secrets is a map");
+            .as_integer()
+            .unwrap();
 
-        // Alice and Bob is a 2-leaf tree: consuming Bob's leaf ratchet also
-        // splits the root into the two leaves' Secret entries, so Alice's
-        // own leaf's interior frontier secret should still be present.
-        assert!(
-            !node_secrets.is_empty(),
-            "splitting the tree to reach bob's leaf should leave a node_secrets frontier"
+        assert_eq!(
+            message_secrets_depth,
+            ciborium::value::Integer::from(message_secrets.len() as u64),
+            "retention.message_secrets_depth must match the number of epochs exported"
+        );
+
+        let resumption_psk_depth = retention
+            .iter()
+            .find(|(k, _)| k == &Value::from(0u64))
+            .unwrap()
+            .1
+            .as_integer()
+            .unwrap();
+
+        assert_eq!(
+            resumption_psk_depth,
+            ciborium::value::Integer::from(resumption_psks.len() as u64),
+            "retention.resumption_psk_depth must match the number of epochs exported"
         );
     }
 }
