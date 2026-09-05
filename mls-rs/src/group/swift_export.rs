@@ -655,3 +655,142 @@ mod tests {
         );
     }
 }
+
+/// GENERATOR, not a correctness test: running `generate_swift_migration_fixture`
+/// overwrites `test_data/swift-migration-p256.json` (GER-2372 end-to-end
+/// fixture for the swift-mls migration). Kept separate from `mod tests` above
+/// so it's obvious at a glance which test in this file has a file-system
+/// side effect.
+#[cfg(test)]
+mod fixture_gen {
+    use serde::Serialize;
+
+    use crate::{
+        cipher_suite::CipherSuite,
+        client::test_utils::TEST_PROTOCOL_VERSION,
+        group::{test_utils::test_n_member_group, ReceivedMessage},
+    };
+
+    #[derive(Serialize)]
+    struct FixtureMessage {
+        epoch: u64,
+        sender_leaf: u32,
+        ciphertext: String,
+        plaintext: String,
+    }
+
+    #[derive(Serialize)]
+    struct Fixture {
+        cipher_suite: u16,
+        exporter_leaf: u32,
+        export: String,
+        messages: Vec<FixtureMessage>,
+    }
+
+    /// Builds a 2-member P256_AES128 group, has Bob encrypt one message in
+    /// each of two epochs that Alice never processes, exports Alice's live
+    /// state via `export_for_swift`, and -- only after confirming on a clone
+    /// of Alice that her pre-migration state still decrypts both messages
+    /// fresh -- writes the fixture a restored swift group can be tested
+    /// against. A failing self-check panics instead of writing a fixture
+    /// that would let a consuming (non-forward-secret) migration pass.
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn generate_swift_migration_fixture() {
+        let cipher_suite = CipherSuite::P256_AES128;
+
+        let mut groups = test_n_member_group(TEST_PROTOCOL_VERSION, cipher_suite, 2).await;
+
+        // Message A: prior epoch. Alice never processes it.
+        let message_a = groups[1]
+            .encrypt_application_message(b"prior-epoch hello", vec![])
+            .await
+            .unwrap();
+
+        let epoch_a = groups[0].context().epoch;
+
+        // Advance one epoch via an empty commit. Alice and Bob process only
+        // the commit -- never messages A or B.
+        let commit_output = groups[0].commit(vec![]).await.unwrap();
+        groups[0].apply_pending_commit().await.unwrap();
+
+        groups[1]
+            .process_incoming_message(commit_output.commit_message)
+            .await
+            .unwrap();
+
+        // Message B: current epoch. Alice never processes it.
+        let message_b = groups[1]
+            .encrypt_application_message(b"current-epoch hello", vec![])
+            .await
+            .unwrap();
+
+        let epoch_b = groups[0].context().epoch;
+        assert_eq!(
+            epoch_b,
+            epoch_a + 1,
+            "epoch_b must be exactly one past epoch_a"
+        );
+
+        let export = groups[0].export_for_swift().await.unwrap();
+
+        // Self-check on a CLONE, so Alice's real (exported) state stays
+        // unconsumed: prove her pre-migration state decrypts both the
+        // prior-epoch and current-epoch message fresh.
+        let mut alice_check = groups[0].clone();
+
+        match alice_check
+            .process_incoming_message(message_a.clone())
+            .await
+            .unwrap()
+        {
+            ReceivedMessage::ApplicationMessage(m) => assert_eq!(
+                m.data(),
+                b"prior-epoch hello",
+                "self-check: message A decrypted to unexpected plaintext"
+            ),
+            other => panic!("self-check: message A was not an application message: {other:?}"),
+        }
+
+        match alice_check
+            .process_incoming_message(message_b.clone())
+            .await
+            .unwrap()
+        {
+            ReceivedMessage::ApplicationMessage(m) => assert_eq!(
+                m.data(),
+                b"current-epoch hello",
+                "self-check: message B decrypted to unexpected plaintext"
+            ),
+            other => panic!("self-check: message B was not an application message: {other:?}"),
+        }
+
+        let fixture = Fixture {
+            cipher_suite: u16::from(cipher_suite),
+            exporter_leaf: 0,
+            export: hex::encode(&export),
+            messages: vec![
+                FixtureMessage {
+                    epoch: epoch_a,
+                    sender_leaf: 1,
+                    ciphertext: hex::encode(message_a.to_bytes().unwrap()),
+                    plaintext: hex::encode(b"prior-epoch hello"),
+                },
+                FixtureMessage {
+                    epoch: epoch_b,
+                    sender_leaf: 1,
+                    ciphertext: hex::encode(message_b.to_bytes().unwrap()),
+                    plaintext: hex::encode(b"current-epoch hello"),
+                },
+            ],
+        };
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/swift-migration-p256.json"
+        );
+
+        std::fs::write(path, serde_json::to_string_pretty(&fixture).unwrap()).unwrap();
+
+        std::eprintln!("wrote fixture to {path}");
+    }
+}
