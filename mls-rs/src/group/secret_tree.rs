@@ -420,13 +420,16 @@ impl<T: TreeIndex> SecretTree<T> {
 /// is not exposed outside it, so this shaping happens here rather than in
 /// `group::swift_export`, which only sees the plain data below.
 #[cfg(feature = "swift_export")]
+type ExportedSkippedKey = (u32, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
+
+#[cfg(feature = "swift_export")]
 pub(crate) struct ExportedChain {
     pub(crate) head_generation: u32,
     /// Always `Some` for the prototype: mls-rs's live `SecretKeyRatchet` has no
     /// "retired" representation (§4.3's `head_secret` absent / `head_generation
     /// == 2^32` case), so this transform never produces one.
     pub(crate) head_secret: Zeroizing<Vec<u8>>,
-    pub(crate) skipped: Vec<(u32, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>)>,
+    pub(crate) skipped: Vec<ExportedSkippedKey>,
 }
 
 #[cfg(feature = "swift_export")]

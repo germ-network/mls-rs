@@ -114,6 +114,24 @@ impl ExporterTree {
         }
     }
 
+    /// PROTOTYPE (swift-mls export, spec/snapshot.md §4.6): the surviving
+    /// node-secret frontier, read-only. The inner tree is private to this
+    /// module, so `group::swift_export` goes through here rather than
+    /// duplicating the field.
+    #[cfg(feature = "swift_export")]
+    pub(crate) fn export_frontier(
+        &self,
+    ) -> Vec<(NodeIndex, super::secret_tree::ExportedSecretTreeEntry)> {
+        self.0.export_entries()
+    }
+
+    /// PROTOTYPE (swift-mls export, spec/snapshot.md §4.6): the tree's leaf
+    /// count, which the snapshot format requires to be exactly 2^16.
+    #[cfg(feature = "swift_export")]
+    pub(crate) fn leaf_count(&self) -> NodeIndex {
+        self.0.leaf_count()
+    }
+
     /// The leaf for component id `c` is at node index `2 c` in the array
     /// representation of RFC 9420 Appendix C, the same mapping as
     /// `From<LeafIndex> for NodeIndex` (a ComponentID is not a member
