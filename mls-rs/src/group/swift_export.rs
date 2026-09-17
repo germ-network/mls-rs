@@ -153,10 +153,10 @@ const ML_KEM_768_CRYPTOKIT_SECRET_LEN: usize = 96;
 /// suite's secret is provider-specific, so its form is pinned here.
 fn check_secret_key_len(suite: u16, key: &[u8]) -> Result<(), MlsError> {
     let expected = match suite {
-        1 | 2 | 3 => 32, // X25519, P-256, X25519 (0x0003 DHKEMX25519_CHACHA20POLY1305)
-        7 => 48,         // P-384
-        4 | 6 => 56,     // X448
-        5 => 66,         // P-521
+        1..=3 => 32, // X25519, P-256, X25519 (0x0003 DHKEMX25519_CHACHA20POLY1305)
+        7 => 48,     // P-384
+        4 | 6 => 56, // X448
+        5 => 66,     // P-521
         ML_KEM_768_SUITE => ML_KEM_768_CRYPTOKIT_SECRET_LEN,
         // The suite allowlist is checked before any secret is touched.
         _ => return Ok(()),
