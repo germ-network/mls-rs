@@ -33,7 +33,16 @@ psk = []
 non_domain_separated_hpke_encrypt_decrypt = []
 prior_epoch_membership_key = []
 x509 = ["mls-rs-core/x509", "dep:mls-rs-identity-x509"]
-rfc_compliant = ["private_message", "custom_proposal", "out_of_order", "psk", "x509", "prior_epoch", "by_ref_proposal", "mls-rs-core/rfc_compliant"]
+rfc_compliant = [
+  "private_message",
+  "custom_proposal",
+  "out_of_order",
+  "psk",
+  "x509",
+  "prior_epoch",
+  "by_ref_proposal",
+  "mls-rs-core/rfc_compliant",
+]
 last_resort_key_package_ext = ["mls-rs-core/last_resort_key_package_ext"]
 self_remove_proposal = ["mls-rs-core/self_remove_proposal"]
 export_key_generation = []
@@ -45,7 +54,37 @@ gsma_rcs_e2ee_feature = ["mls-rs-core/gsma_rcs_e2ee_feature"]
 # versa).
 safe_extensions = ["psk"]
 
-std = ["mls-rs-core/std", "mls-rs-codec/std", "mls-rs-identity-x509?/std", "hex/std", "futures/std", "itertools/use_std", "zeroize/std", "dep:debug_tree", "dep:thiserror", "serde?/std", "subtle/std"]
+# PROTOTYPE: live-state export of a Group's in-memory secrets into the
+# swift-mls snapshot archive format (see swift-mls/spec/snapshot.md).
+# `safe_extensions` is pulled in because the format-2 core carries the
+# exporter-tree frontier (snapshot.md §4.6); like `safe_extensions` itself,
+# enabling this feature adds a field to the serialized `EpochSecrets`, so
+# group state stored without it cannot be loaded with it enabled (and vice
+# versa). `by_ref_proposal` is pulled in because a format-2 membership
+# carries `pending_updates` (snapshot.md §4.1.2).
+swift_export = [
+  "dep:ciborium",
+  "std",
+  "private_message",
+  "psk",
+  "prior_epoch",
+  "safe_extensions",
+  "by_ref_proposal",
+]
+
+std = [
+  "mls-rs-core/std",
+  "mls-rs-codec/std",
+  "mls-rs-identity-x509?/std",
+  "hex/std",
+  "futures/std",
+  "itertools/use_std",
+  "zeroize/std",
+  "dep:debug_tree",
+  "dep:thiserror",
+  "serde?/std",
+  "subtle/std",
+]
 
 serde = ["mls-rs-core/serde", "zeroize/serde", "dep:serde", "dep:hex"]
 
@@ -58,18 +97,31 @@ sqlcipher-bundled = ["sqlite", "mls-rs-provider-sqlite/sqlcipher-bundled"]
 test_util = []
 benchmark_util = ["test_util", "default", "dep:mls-rs-crypto-openssl"]
 benchmark_pq_crypto = ["mls-rs-crypto-awslc/post-quantum"]
-fuzz_util = ["test_util", "default", "dep:once_cell", "dep:mls-rs-crypto-openssl"]
+fuzz_util = [
+  "test_util",
+  "default",
+  "dep:once_cell",
+  "dep:mls-rs-crypto-openssl",
+]
 
 [dependencies]
 mls-rs-core = { path = "../mls-rs-core", default-features = false, version = "0.27.0" }
 mls-rs-identity-x509 = { path = "../mls-rs-identity-x509", default-features = false, version = "0.21.0", optional = true }
-zeroize = { version = "1", default-features = false, features = ["alloc", "zeroize_derive"] }
-mls-rs-codec = { version = "0.7", path = "../mls-rs-codec", default-features = false}
+zeroize = { version = "1", default-features = false, features = [
+  "alloc",
+  "zeroize_derive",
+] }
+mls-rs-codec = { version = "0.7", path = "../mls-rs-codec", default-features = false }
 thiserror = { version = "2", optional = true }
-itertools = { version = "0.14.0", default-features = false, features = ["use_alloc"]}
+itertools = { version = "0.14.0", default-features = false, features = [
+  "use_alloc",
+] }
 cfg-if = "1"
 debug_tree = { version = "0.4.0", optional = true }
-spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }
+spin = { version = "0.10", default-features = false, features = [
+  "mutex",
+  "spin_mutex",
+] }
 maybe-async = { version = "0.2.10" }
 subtle = { version = "2.6.1", default-features = false, features = ["i128"] }
 
@@ -81,49 +133,82 @@ mls-rs-crypto-openssl = { path = "../mls-rs-crypto-openssl", optional = true, ve
 rayon = { version = "1", optional = true }
 arbitrary = { version = "1", features = ["derive"], optional = true }
 once_cell = { version = "1.18", optional = true }
-serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
-hex = { version = "^0.4.3", default-features = false, features = ["serde", "alloc"], optional = true }
+serde = { version = "1.0", default-features = false, features = [
+  "alloc",
+  "derive",
+], optional = true }
+hex = { version = "^0.4.3", default-features = false, features = [
+  "serde",
+  "alloc",
+], optional = true }
+ciborium = { version = "0.2", optional = true }
 
 # Only for benchmarks
 mls-rs-crypto-awslc = { path = "../mls-rs-crypto-awslc", optional = true, version = "0.25" }
 
 # Async mode dependencies
 [target.'cfg(mls_build_async)'.dependencies]
-futures = { version = "0.3.25", default-features = false, features = ["alloc"]}
+futures = { version = "0.3.25", default-features = false, features = ["alloc"] }
 async-trait = "0.1.74"
 
 [target.'cfg(not(target_has_atomic = "ptr"))'.dependencies]
-portable-atomic = { version = "1.5.1", default-features = false, features = ["critical-section"] }
-portable-atomic-util = { version = "0.2", default-features = false, features = ["alloc"] }
-spin = { version = "0.10", default-features = false, features = ["portable_atomic"] }
+portable-atomic = { version = "1.5.1", default-features = false, features = [
+  "critical-section",
+] }
+portable-atomic-util = { version = "0.2", default-features = false, features = [
+  "alloc",
+] }
+spin = { version = "0.10", default-features = false, features = [
+  "portable_atomic",
+] }
 
 [target.'cfg(mls_build_async)'.dev-dependencies]
 futures-test = "0.3.25"
 
 [dev-dependencies]
 assert_matches = "1.5.0"
-criterion = { version = "0.8", features = ["async_futures", "html_reports"], default-features = false }
+criterion = { version = "0.8", features = [
+  "async_futures",
+  "html_reports",
+], default-features = false }
 serde_json = "^1.0"
 rand = "0.9"
-serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
-hex = { version = "^0.4.3", default-features = false, features = ["serde", "alloc"] }
+serde = { version = "1.0", default-features = false, features = [
+  "alloc",
+  "derive",
+] }
+hex = { version = "^0.4.3", default-features = false, features = [
+  "serde",
+  "alloc",
+] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { version = "0.2" }
-getrandom = { version = "0.2", features = ["js", "custom"], default-features = false }
+getrandom = { version = "0.2", features = [
+  "js",
+  "custom",
+], default-features = false }
 rand_core = { version = "0.6", default-features = false, features = ["alloc"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = { version = "0.3" }
 mls-rs-crypto-webcrypto = { path = "../mls-rs-crypto-webcrypto", version = "0.15.0" }
-criterion = { version = "0.8", default-features = false, features = ["plotters", "cargo_bench_support", "async_futures", "html_reports"] }
+criterion = { version = "0.8", default-features = false, features = [
+  "plotters",
+  "cargo_bench_support",
+  "async_futures",
+  "html_reports",
+] }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-mls-rs-crypto-openssl = { path = "../mls-rs-crypto-openssl", version = "0.21.0"}
+mls-rs-crypto-openssl = { path = "../mls-rs-crypto-openssl", version = "0.21.0" }
 criterion = { version = "0.8", features = ["async_futures", "html_reports"] }
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mls_build_async)', 'cfg(coverage_nightly)'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(mls_build_async)',
+  'cfg(coverage_nightly)',
+] }
 
 [[example]]
 name = "basic_usage"
