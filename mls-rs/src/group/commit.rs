@@ -37,6 +37,12 @@ use crate::{
     psk::ExternalPskId,
 };
 
+#[cfg(feature = "safe_extensions")]
+use crate::{
+    group::{component_operation::ComponentID, exporter_tree::ExporterTree},
+    psk::ApplicationPsk,
+};
+
 use super::{
     confirmation_tag::ConfirmationTag,
     framing::{Content, MlsMessage, MlsMessagePayload, Sender},
@@ -228,6 +234,39 @@ where
     #[cfg(feature = "psk")]
     pub fn add_external_psk(mut self, psk_id: ExternalPskId) -> Result<Self, MlsError> {
         let key_id = JustPreSharedKeyID::External(psk_id);
+        let proposal = self.group.psk_proposal(key_id)?;
+        self.proposals.push(proposal);
+        Ok(self)
+    }
+
+    /// Insert a
+    /// [`PreSharedKeyProposal`](crate::group::proposal::PreSharedKeyProposal) with
+    /// an application PSK (`psk_type = application(3)` from
+    /// draft-ietf-mls-extensions-08) into the current commit that is being
+    /// built.
+    ///
+    /// Each group member will need to have the PSK value installed within the
+    /// [`PreSharedKeyStorage`](mls_rs_core::psk::PreSharedKeyStorage) in use
+    /// by this group under the key given by
+    /// [`ApplicationPsk::storage_id`](crate::psk::ApplicationPsk::storage_id)
+    /// upon processing a [commit](Group::commit) that contains this proposal.
+    #[cfg(feature = "safe_extensions")]
+    pub fn add_application_psk(
+        mut self,
+        component_id: ComponentID,
+        psk_id: Vec<u8>,
+    ) -> Result<Self, MlsError> {
+        // An application PSK is resolved from a value exported with
+        // `SafeExportSecret(component_id)` (see [`Group::safe_export_secret`]),
+        // whose Exporter Tree has only 2^16 leaves. Reject an out-of-range
+        // component_id where the caller supplies it, so a commit can never
+        // reference an application PSK that no member could have exported to
+        // install — the same bound `ExporterTree::safe_export_secret` enforces
+        // on the export side.
+        if component_id >= ExporterTree::LEAF_COUNT {
+            return Err(MlsError::InvalidComponentId);
+        }
+        let key_id = JustPreSharedKeyID::Application(ApplicationPsk::new(component_id, psk_id));
         let proposal = self.group.psk_proposal(key_id)?;
         self.proposals.push(proposal);
         Ok(self)

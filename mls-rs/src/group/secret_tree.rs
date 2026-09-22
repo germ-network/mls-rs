@@ -35,6 +35,15 @@ impl SecretTreeNode {
             None
         }
     }
+
+    #[cfg(feature = "safe_extensions")]
+    fn as_secret(&self) -> Option<&TreeSecret> {
+        if let SecretTreeNode::Secret(secret) = self {
+            Some(secret)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, MlsEncode, MlsDecode, MlsSize)]
@@ -96,6 +105,11 @@ impl<T: TreeIndex> TreeSecretsVec<T> {
 
     fn take_node(&mut self, index: &T) -> Option<SecretTreeNode> {
         self.inner.remove(index)
+    }
+
+    #[cfg(feature = "safe_extensions")]
+    fn get_node(&self, index: &T) -> Option<&SecretTreeNode> {
+        self.inner.get(index)
     }
 }
 
@@ -211,27 +225,38 @@ impl<T: TreeIndex> SecretTree<T> {
         Ok(())
     }
 
+    /// Take the node at the leaf `leaf_index`, deriving it first if needed by
+    /// consuming its remaining ancestors from the root down (RFC 9420
+    /// Section 9.2 deletion schedule). Returns `None` if the leaf was already
+    /// consumed.
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    async fn take_leaf_node<P: CipherSuiteProvider>(
+        &mut self,
+        cipher_suite: &P,
+        leaf_index: &T,
+    ) -> Result<Option<SecretTreeNode>, MlsError> {
+        if let Some(node) = self.known_secrets.take_node(leaf_index) {
+            return Ok(Some(node));
+        }
+
+        // Start at the root node and work your way down consuming any intermediates needed
+        for i in leaf_index.direct_copath(&self.leaf_count).into_iter().rev() {
+            self.consume_node(cipher_suite, &i.path).await?;
+        }
+
+        Ok(self.known_secrets.take_node(leaf_index))
+    }
+
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     async fn take_leaf_ratchet<P: CipherSuiteProvider>(
         &mut self,
         cipher_suite: &P,
         leaf_index: &T,
     ) -> Result<SecretRatchets, MlsError> {
-        let node_index = leaf_index;
-
-        let node = match self.known_secrets.take_node(node_index) {
-            Some(node) => node,
-            None => {
-                // Start at the root node and work your way down consuming any intermediates needed
-                for i in node_index.direct_copath(&self.leaf_count).into_iter().rev() {
-                    self.consume_node(cipher_suite, &i.path).await?;
-                }
-
-                self.known_secrets
-                    .take_node(node_index)
-                    .ok_or(MlsError::InvalidLeafConsumption)?
-            }
-        };
+        let node = self
+            .take_leaf_node(cipher_suite, leaf_index)
+            .await?
+            .ok_or(MlsError::InvalidLeafConsumption)?;
 
         Ok(match node {
             SecretTreeNode::Ratchet(ratchet) => ratchet,
@@ -241,6 +266,89 @@ impl<T: TreeIndex> SecretTree<T> {
                 handshake: SecretKeyRatchet::new(cipher_suite, &secret, KeyType::Handshake).await?,
             },
         })
+    }
+
+    /// Take the `tree_node_secret` at the leaf node `leaf_index`, consuming it.
+    ///
+    /// Any intermediate node secrets on the path from the root to the leaf are
+    /// deleted as soon as their children are derived, and the leaf secret
+    /// itself is deleted upon being returned, following the deletion schedule
+    /// in RFC 9420 Section 9.2. Requesting the same leaf twice is an error.
+    #[cfg(feature = "safe_extensions")]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub(crate) async fn take_leaf_secret<P: CipherSuiteProvider>(
+        &mut self,
+        cipher_suite_provider: &P,
+        leaf_index: T,
+    ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        // An empty tree (e.g. the placeholder state used while building an
+        // external commit) has no root secret to consume.
+        if self.leaf_count == T::zero() {
+            return Err(MlsError::ComponentSecretConsumed);
+        }
+
+        self.take_leaf_node(cipher_suite_provider, &leaf_index)
+            .await?
+            .and_then(SecretTreeNode::into_secret)
+            .map(|secret| secret.0)
+            .ok_or(MlsError::ComponentSecretConsumed)
+    }
+
+    /// Derive the `tree_node_secret` at the leaf node `leaf_index` without
+    /// consuming anything.
+    ///
+    /// Unlike [`SecretTree::take_leaf_secret`] this leaves the tree untouched:
+    /// intermediate secrets are derived in memory and dropped, so the same leaf
+    /// stays derivable for as long as one of its ancestors is retained. Fails
+    /// with [`MlsError::ComponentSecretConsumed`] once every node on the path
+    /// from the root to the leaf has been deleted.
+    #[cfg(feature = "safe_extensions")]
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub(crate) async fn peek_leaf_secret<P: CipherSuiteProvider>(
+        &self,
+        cipher_suite_provider: &P,
+        leaf_index: T,
+    ) -> Result<Zeroizing<Vec<u8>>, MlsError> {
+        if self.leaf_count == T::zero() {
+            return Err(MlsError::ComponentSecretConsumed);
+        }
+
+        // `direct_copath` yields ancestors leaf-side first and excludes the
+        // node itself, so reversing it and appending the leaf gives the full
+        // root-to-leaf descent.
+        let mut descent = leaf_index
+            .direct_copath(&self.leaf_count)
+            .into_iter()
+            .rev()
+            .map(|node| node.path)
+            .collect::<Vec<_>>();
+
+        descent.push(leaf_index);
+
+        let (start, mut secret) = descent
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, index)| {
+                self.known_secrets
+                    .get_node(index)
+                    .and_then(SecretTreeNode::as_secret)
+                    .map(|secret| (i, secret.0.clone()))
+            })
+            .ok_or(MlsError::ComponentSecretConsumed)?;
+
+        for window in descent[start..].windows(2) {
+            let label: &[u8] = if window[0].left().as_ref() == Some(&window[1]) {
+                b"left"
+            } else {
+                b"right"
+            };
+
+            secret =
+                kdf_expand_with_label(cipher_suite_provider, &secret, b"tree", label, None).await?;
+        }
+
+        Ok(secret)
     }
 
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
@@ -303,6 +411,78 @@ impl<T: TreeIndex> SecretTree<T> {
             .set_node(leaf_index, SecretTreeNode::Ratchet(ratchet));
 
         Ok(res)
+    }
+}
+
+/// PROTOTYPE (swift-mls export, spec §4.3 "secret tree split"): a read-only,
+/// non-mutating digest of every entry mls-rs's secret tree currently holds.
+/// `known_secrets`/`leaf_count` are private to this module, and `SecretTreeNode`
+/// is not exposed outside it, so this shaping happens here rather than in
+/// `group::swift_export`, which only sees the plain data below.
+#[cfg(feature = "swift_export")]
+type ExportedSkippedKey = (u32, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
+
+#[cfg(feature = "swift_export")]
+pub(crate) struct ExportedChain {
+    pub(crate) head_generation: u32,
+    /// Always `Some` for the prototype: mls-rs's live `SecretKeyRatchet` has no
+    /// "retired" representation (§4.3's `head_secret` absent / `head_generation
+    /// == 2^32` case), so this transform never produces one.
+    pub(crate) head_secret: Zeroizing<Vec<u8>>,
+    pub(crate) skipped: Vec<ExportedSkippedKey>,
+}
+
+#[cfg(feature = "swift_export")]
+pub(crate) enum ExportedSecretTreeEntry {
+    Secret(Zeroizing<Vec<u8>>),
+    Ratchet {
+        application: ExportedChain,
+        handshake: ExportedChain,
+    },
+}
+
+#[cfg(feature = "swift_export")]
+impl SecretKeyRatchet {
+    fn export(&self) -> ExportedChain {
+        let mut skipped = Vec::new();
+
+        #[cfg(feature = "out_of_order")]
+        for (generation, key_data) in self.history.iter() {
+            skipped.push((*generation, key_data.key.clone(), key_data.nonce.clone()));
+        }
+
+        ExportedChain {
+            head_generation: self.generation,
+            head_secret: self.secret.0.clone(),
+            skipped,
+        }
+    }
+}
+
+#[cfg(feature = "swift_export")]
+impl<T: TreeIndex> SecretTree<T> {
+    pub(crate) fn leaf_count(&self) -> T {
+        self.leaf_count.clone()
+    }
+
+    pub(crate) fn export_entries(&self) -> Vec<(T, ExportedSecretTreeEntry)> {
+        self.known_secrets
+            .inner
+            .iter()
+            .map(|(index, node)| {
+                let exported = match node {
+                    SecretTreeNode::Secret(secret) => {
+                        ExportedSecretTreeEntry::Secret(secret.0.clone())
+                    }
+                    SecretTreeNode::Ratchet(ratchet) => ExportedSecretTreeEntry::Ratchet {
+                        application: ratchet.application.export(),
+                        handshake: ratchet.handshake.export(),
+                    },
+                };
+
+                (index.clone(), exported)
+            })
+            .collect()
     }
 }
 

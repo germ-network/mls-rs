@@ -333,18 +333,116 @@ pub(crate) mod test_utils {
 #[cfg(test)]
 mod tests {
     use alloc::vec;
+
+    #[cfg(all(
+        feature = "std",
+        feature = "by_ref_proposal",
+        not(feature = "safe_extensions")
+    ))]
     use mls_rs_core::group::{GroupState, GroupStateStorage};
 
+    #[cfg(all(
+        feature = "std",
+        feature = "by_ref_proposal",
+        not(feature = "safe_extensions")
+    ))]
     use crate::{
-        client::test_utils::{TestClientBuilder, TEST_CIPHER_SUITE, TEST_PROTOCOL_VERSION},
+        client::test_utils::TestClientBuilder,
+        storage_provider::in_memory::InMemoryGroupStateStorage,
+    };
+
+    use crate::{
+        client::test_utils::{TEST_CIPHER_SUITE, TEST_PROTOCOL_VERSION},
         group::{
             test_utils::{test_group, TestGroup},
             Group,
         },
-        storage_provider::in_memory::InMemoryGroupStateStorage,
     };
 
-    #[cfg(all(feature = "std", feature = "by_ref_proposal"))]
+    /// Stored-state interop for the `safe_extensions` build, which `legacy_interop`
+    /// above cannot cover: that feature changed the `EpochSecrets` layout, so the
+    /// pre-feature blob it pins does not decode here.
+    ///
+    /// These blobs were captured from `germ-shadow-safe-exporter` — the build that
+    /// shipped the exporter tree — and pin two things at once: that the upstream
+    /// resync did not disturb the persisted layout, and that adding attachment CEKs
+    /// on top of the exporter tree did not either.
+    #[cfg(all(
+        feature = "std",
+        feature = "by_ref_proposal",
+        feature = "safe_extensions",
+        feature = "prior_epoch",
+        not(feature = "prior_epoch_membership_key")
+    ))]
+    mod shipped_state_interop {
+        use assert_matches::assert_matches;
+        use mls_rs_codec::MlsDecode;
+
+        use crate::client::test_utils::{TestClientBuilder, TEST_CIPHER_SUITE};
+        use crate::client::MlsError;
+        use crate::crypto::test_utils::test_cipher_suite_provider;
+        use crate::group::epoch::PriorEpoch;
+
+        #[cfg(target_arch = "wasm32")]
+        use wasm_bindgen_test::wasm_bindgen_test as test;
+
+        const SHIPPED_SNAPSHOT: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/shipped_safe_extensions_snapshot.mls"
+        ));
+
+        const SHIPPED_PRIOR_EPOCH: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/shipped_safe_extensions_prior_epoch.mls"
+        ));
+
+        /// A group snapshot written by the shipped build still loads, and its
+        /// exporter tree still yields attachment CEKs.
+        #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+        async fn shipped_snapshot_loads_and_derives() {
+            let snapshot = super::super::Snapshot::mls_decode(&mut &*SHIPPED_SNAPSHOT).unwrap();
+
+            let config = TestClientBuilder::new_for_test()
+                .with_random_signing_identity("alice", TEST_CIPHER_SUITE)
+                .await
+                .build()
+                .config;
+
+            let group = super::super::Group::from_snapshot(config, snapshot)
+                .await
+                .unwrap();
+
+            let cek = group.attachment_cek(0x8000, b"object").await.unwrap();
+            assert_eq!(cek.as_bytes().len(), 32);
+        }
+
+        /// The shipped build cleared the exporter tree when archiving a prior
+        /// epoch, so pre-upgrade epochs must decode but decline to derive,
+        /// rather than producing a wrong key.
+        #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+        async fn shipped_prior_epoch_decodes_and_degrades() {
+            let epoch = PriorEpoch::mls_decode(&mut &*SHIPPED_PRIOR_EPOCH).unwrap();
+
+            let cs = test_cipher_suite_provider(TEST_CIPHER_SUITE);
+
+            let res = epoch
+                .secrets
+                .exporter_tree
+                .peek_export_secret(&cs, 0x8000)
+                .await;
+
+            assert_matches!(res, Err(MlsError::ComponentSecretConsumed));
+        }
+    }
+
+    // The `safe_extensions` feature adds a field to the serialized
+    // `EpochSecrets`, so snapshots stored without the feature enabled cannot
+    // be decoded with it enabled.
+    #[cfg(all(
+        feature = "std",
+        feature = "by_ref_proposal",
+        not(feature = "safe_extensions")
+    ))]
     #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
     async fn legacy_interop() {
         let mut storage = InMemoryGroupStateStorage::new();

@@ -38,6 +38,9 @@ use crate::group::proposal::PreSharedKeyProposal;
 #[cfg(feature = "psk")]
 use crate::group::{JustPreSharedKeyID, ResumptionPSKUsage, ResumptionPsk};
 
+#[cfg(feature = "psk")]
+use alloc::borrow::Cow;
+
 #[cfg(all(feature = "std", feature = "psk"))]
 use std::collections::HashSet;
 
@@ -397,14 +400,16 @@ where
     for i in 0..proposals.psk_proposals().len() {
         let p = &proposals.psks[i];
 
-        let valid = matches!(
-            p.proposal.psk.key_id,
-            JustPreSharedKeyID::External(_)
-                | JustPreSharedKeyID::Resumption(ResumptionPsk {
-                    usage: ResumptionPSKUsage::Application,
-                    ..
-                })
-        );
+        let valid = match &p.proposal.psk.key_id {
+            JustPreSharedKeyID::External(_) => true,
+            JustPreSharedKeyID::Resumption(ResumptionPsk {
+                usage: ResumptionPSKUsage::Application,
+                ..
+            }) => true,
+            JustPreSharedKeyID::Resumption(_) => false,
+            #[cfg(feature = "safe_extensions")]
+            JustPreSharedKeyID::Application(_) => true,
+        };
 
         let nonce_length = p.proposal.psk.psk_nonce.0.len();
         let nonce_valid = nonce_length == kdf_extract_size;
@@ -415,9 +420,19 @@ where
         #[cfg(not(feature = "std"))]
         let is_new_id = !ids_seen.contains(&p.proposal.psk);
 
-        let external_id_is_valid = match &p.proposal.psk.key_id {
-            JustPreSharedKeyID::External(id) => psk_storage
-                .contains(id)
+        // The storage key whose presence must be validated, if any. Errors
+        // stay inside the result so that by-reference proposals go through
+        // `apply_strategy` like any other invalid proposal.
+        let storage_id = match &p.proposal.psk.key_id {
+            JustPreSharedKeyID::External(id) => Ok(Some(Cow::Borrowed(id))),
+            JustPreSharedKeyID::Resumption(_) => Ok(None),
+            #[cfg(feature = "safe_extensions")]
+            JustPreSharedKeyID::Application(psk) => psk.storage_id().map(|id| Some(Cow::Owned(id))),
+        };
+
+        let external_id_is_valid = match storage_id {
+            Ok(Some(id)) => psk_storage
+                .contains(&id)
                 .await
                 .map_err(|e| MlsError::PskStoreError(e.into_any_error()))
                 .and_then(|found| {
@@ -427,7 +442,8 @@ where
                         Err(MlsError::MissingRequiredPsk)
                     }
                 }),
-            JustPreSharedKeyID::Resumption(_) => Ok(()),
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
         };
 
         #[cfg(not(feature = "by_ref_proposal"))]
