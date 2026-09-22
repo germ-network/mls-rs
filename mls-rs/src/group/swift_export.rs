@@ -586,6 +586,17 @@ where
 
         archive.to_cbor()
     }
+
+    /// The signer the group currently signs with, which the swift-mls snapshot
+    /// excludes by design (snapshot.md §2) -- for a migrator whose destination must
+    /// be handed the leaf's signing key out of band. A pending commit's replacement
+    /// is not reflected until it is applied, but a failed incoming commit that
+    /// carried this member's identity-rotating Update can leave the replacement
+    /// here while the leaf still presents the old key: verify it against the leaf
+    /// before use.
+    pub fn signer_for_swift_export(&self) -> &SignatureSecretKey {
+        &self.signer
+    }
 }
 
 /// Maps a pending-update set onto the membership's `pending_updates`
@@ -752,7 +763,9 @@ mod tests {
     use crate::{
         cipher_suite::CipherSuite,
         client::test_utils::{TEST_CIPHER_SUITE, TEST_PROTOCOL_VERSION},
+        crypto::{test_utils::test_cipher_suite_provider, CipherSuiteProvider},
         group::test_utils::test_n_member_group,
+        identity::test_utils::get_test_signing_identity,
     };
 
     #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
@@ -943,6 +956,50 @@ mod tests {
             resumption_psk_depth,
             ciborium::value::Integer::from(resumption_psks.len() as u64),
             "retention.resumption_psk_depth must match the number of epochs exported"
+        );
+    }
+
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn signer_for_swift_export_matches_current_identity() {
+        let cipher_suite: CipherSuite = TEST_CIPHER_SUITE;
+        let mut groups = test_n_member_group(TEST_PROTOCOL_VERSION, cipher_suite, 2).await;
+        let cs = test_cipher_suite_provider(cipher_suite);
+
+        let derived_public_key = cs
+            .signature_key_derive_public(groups[0].signer_for_swift_export())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            derived_public_key,
+            groups[0]
+                .current_member_signing_identity()
+                .unwrap()
+                .signature_key
+        );
+
+        // The accessor tracks a signer replacement: after a commit that
+        // rotates the committer's signing identity, it returns the new key.
+        let (new_identity, new_signer) = get_test_signing_identity(cipher_suite, b"new").await;
+
+        groups[0]
+            .commit_builder()
+            .set_new_signing_identity(new_signer.clone(), new_identity.clone())
+            .build()
+            .await
+            .unwrap();
+
+        assert_ne!(groups[0].signer_for_swift_export(), &new_signer);
+
+        groups[0].apply_pending_commit().await.unwrap();
+
+        assert_eq!(groups[0].signer_for_swift_export(), &new_signer);
+        assert_eq!(
+            groups[0]
+                .current_member_signing_identity()
+                .unwrap()
+                .signature_key,
+            new_identity.signature_key
         );
     }
 
