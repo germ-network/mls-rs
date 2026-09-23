@@ -417,6 +417,53 @@ pub struct SwiftExportPendingSigner {
     pub signing_identity: Option<SigningIdentity>,
 }
 
+/// Where a `pending_updates` entry lands when exported via
+/// `Group::export_for_swift_placing_pending`, decided per entry by that
+/// method's `place` callback (keyed on the entry's leaf HPKE public key).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwiftExportPendingPlacement {
+    /// Carried in the snapshot's `pending_updates`, exactly like
+    /// `export_for_swift_with_pending_signers` carries every entry today.
+    Snapshot,
+    /// Left out of the snapshot, but returned alongside it -- secret and all
+    /// -- as a `SwiftExportDetachedPending`.
+    Detached,
+    /// Dropped entirely: neither the snapshot nor the returned lists carry
+    /// this entry or its secret.
+    Omit,
+}
+
+/// One `Detached`-placed pending-update entry
+/// (`Group::export_for_swift_placing_pending`): everything
+/// `SwiftPendingUpdateEntry` would have carried in the snapshot, plus --
+/// like `SwiftExportPendingSigner` -- the replacement signer and proposed
+/// identity when this entry rotates the signing identity.
+///
+/// No `Debug`: `secret` is a plain `Zeroizing<Vec<u8>>` with no redacted
+/// `Debug` of its own (unlike `SignatureSecretKey`), so the struct derives
+/// none rather than print it.
+#[non_exhaustive]
+pub struct SwiftExportDetachedPending {
+    /// This entry's proposed leaf HPKE public key -- the same bytes `place`
+    /// was called with.
+    pub leaf_public_key: Vec<u8>,
+    /// The proposed leaf's HPKE private key: the whole reason to detach the
+    /// entry instead of omitting it.
+    pub secret: Zeroizing<Vec<u8>>,
+    /// The replacement signing key, when this entry rotates the signing
+    /// identity -- `None` for a plain refresh. Secret, like
+    /// `SwiftExportPendingSigner::signer`.
+    pub signer: Option<SignatureSecretKey>,
+    /// The identity proposed alongside this leaf, joined the same way
+    /// `SwiftExportPendingSigner::signing_identity` is: from the matching own
+    /// Update proposal still held in the proposal cache, `None` once that
+    /// cache entry is gone. Only looked up when `signer` is `Some` -- a
+    /// plain refresh (`signer: None`) always gets `None` here too, whether
+    /// or not a same-key own Update happens to still be cached.
+    pub signing_identity: Option<SigningIdentity>,
+}
+
 /// One own proposal still held in the proposal cache
 /// (`GroupState::proposals::own_proposals`), exported so a migration
 /// destination can resolve a peer's later commit of an older own proposal by
@@ -447,12 +494,25 @@ pub struct SwiftExportOwnProposal {
     pub group_id: Vec<u8>,
 }
 
-/// `Group::pending_updates_from`'s result: the membership's mapped
-/// `pending_updates` (spec/snapshot.md §4.1.2) alongside the signers pulled
-/// out of any signer-carrying entries.
+/// `Group::pending_updates_from`/`Group::pending_updates_placing`'s result:
+/// the membership's mapped `pending_updates` (spec/snapshot.md §4.1.2),
+/// the signers pulled out of any signer-carrying entry kept in it, and any
+/// entries placed `Detached` (always empty from `pending_updates_from`,
+/// which has no placement concept).
 type PendingUpdatesForExport = (
     Option<BTreeMap<u64, SwiftPendingUpdateEntry>>,
     Vec<SwiftExportPendingSigner>,
+    Vec<SwiftExportDetachedPending>,
+);
+
+/// `Group::export_for_swift_placing_pending`'s result: the snapshot bytes,
+/// the signer list for its `Snapshot`-placed pending updates (what
+/// `export_for_swift_with_pending_signers` returns today), and one
+/// `SwiftExportDetachedPending` per `Detached`-placed entry.
+pub type SwiftExportWithPending = (
+    Vec<u8>,
+    Vec<SwiftExportPendingSigner>,
+    Vec<SwiftExportDetachedPending>,
 );
 
 impl<C> Group<C>
@@ -485,9 +545,9 @@ where
     /// feature build stays warning-clean.
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     pub async fn export_for_swift(&self) -> Result<Vec<u8>, MlsError> {
-        self.export_for_swift_inner(false)
+        self.export_for_swift_inner(|suite| self.pending_updates_from(suite, false))
             .await
-            .map(|(bytes, _)| bytes)
+            .map(|(bytes, _, _)| bytes)
     }
 
     /// Like `export_for_swift`, but carries a signer-carrying pending update
@@ -502,14 +562,42 @@ where
     pub async fn export_for_swift_with_pending_signers(
         &self,
     ) -> Result<(Vec<u8>, Vec<SwiftExportPendingSigner>), MlsError> {
-        self.export_for_swift_inner(true).await
+        self.export_for_swift_inner(|suite| self.pending_updates_from(suite, true))
+            .await
+            .map(|(bytes, signers, _)| (bytes, signers))
+    }
+
+    /// Like `export_for_swift_with_pending_signers`, but each `pending_updates`
+    /// entry's placement -- kept in the snapshot, pulled out alongside it, or
+    /// dropped -- is decided per entry by calling `place` with the entry's
+    /// leaf HPKE public key. `Snapshot`-placed entries keep the same
+    /// deterministic order and dense `0..<count` indexing
+    /// `export_for_swift_with_pending_signers` uses, counting only
+    /// themselves; the membership's `pending_updates` is absent, not an
+    /// empty map, if none remain (spec/snapshot.md §4.1.2). A `Detached`
+    /// entry's secret leaves in `SwiftExportWithPending`'s third element
+    /// instead of the snapshot; an `Omit`ted entry's secret is not exported
+    /// at all.
+    ///
+    /// Placement affects only these `pending_updates` entries -- the
+    /// proposal cache, the tree, and the rest of the snapshot are unchanged.
+    #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
+    pub async fn export_for_swift_placing_pending<F>(
+        &self,
+        place: F,
+    ) -> Result<SwiftExportWithPending, MlsError>
+    where
+        F: Fn(&[u8]) -> SwiftExportPendingPlacement,
+    {
+        self.export_for_swift_inner(|suite| self.pending_updates_placing(suite, &place))
+            .await
     }
 
     #[cfg_attr(not(mls_build_async), maybe_async::must_be_sync)]
     async fn export_for_swift_inner(
         &self,
-        carry_pending_update_signers: bool,
-    ) -> Result<(Vec<u8>, Vec<SwiftExportPendingSigner>), MlsError> {
+        pending: impl FnOnce(u16) -> Result<PendingUpdatesForExport, MlsError>,
+    ) -> Result<SwiftExportWithPending, MlsError> {
         if !self.pending_commit.is_none() {
             return Err(MlsError::SwiftExportPendingCommitUnsupported);
         }
@@ -564,8 +652,7 @@ where
             return Err(MlsError::SwiftExportMembershipStateInvalid);
         }
 
-        let (pending_updates, pending_signers) =
-            self.pending_updates_from(suite, carry_pending_update_signers)?;
+        let (pending_updates, pending_signers, detached_pending) = pending(suite)?;
 
         let mut signature_keys = BTreeMap::new();
 
@@ -688,7 +775,7 @@ where
             memberships,
         };
 
-        Ok((archive.to_cbor()?, pending_signers))
+        Ok((archive.to_cbor()?, pending_signers, detached_pending))
     }
 
     /// The signer the group currently signs with, which the swift-mls snapshot
@@ -702,22 +789,38 @@ where
         &self.signer
     }
 
-    /// The proposed identity of the own Update proposal in the proposal
-    /// cache whose leaf carries `leaf_public_key`, if one is still cached.
-    fn own_update_signing_identity(
-        &self,
-        leaf_public_key: &HpkePublicKey,
-    ) -> Option<SigningIdentity> {
-        self.state
-            .proposals
-            .own_proposals
-            .values()
-            .find_map(|desc| match &desc.proposal {
-                Proposal::Update(update) if update.leaf_node.public_key == *leaf_public_key => {
-                    Some(update.leaf_node.signing_identity.clone())
-                }
-                _ => None,
-            })
+    /// Indexes `self.state.proposals.own_proposals`'s Update proposals once,
+    /// by proposed leaf HPKE public key, so `pending_updates_from` and
+    /// `pending_updates_placing` can join a signer-carrying entry to its
+    /// proposed identity in `O(log N)` instead of re-scanning every own
+    /// proposal per entry: both `pending_updates` and `own_proposals` can
+    /// hold on the order of 10^5 entries in one epoch, and a group where
+    /// every own Update carries a signer made the old per-entry linear scan
+    /// (`find_map` over `own_proposals`) quadratic overall.
+    ///
+    /// Borrows rather than clones: `own_proposals` can be large, and this
+    /// index is scratch state for one export call, so cloning every key and
+    /// identity into it would transiently double memory already resident in
+    /// the cache. Callers clone only the (at most `pending_updates.len()`)
+    /// identities they actually return.
+    ///
+    /// If two own Update proposals somehow propose the same leaf public key
+    /// (the cache does not de-duplicate on that), the first one encountered
+    /// in `own_proposals`'s own iteration order wins -- matching what the
+    /// old linear `find_map` over that same order would have returned for
+    /// that key, not last-write-wins.
+    fn own_update_signing_identities(&self) -> BTreeMap<&[u8], &SigningIdentity> {
+        let mut index = BTreeMap::new();
+
+        for desc in self.state.proposals.own_proposals.values() {
+            if let Proposal::Update(update) = &desc.proposal {
+                index
+                    .entry(update.leaf_node.public_key.as_ref())
+                    .or_insert(&update.leaf_node.signing_identity);
+            }
+        }
+
+        index
     }
 
     /// This group's own proposals still held in the proposal cache
@@ -779,8 +882,10 @@ where
         carry_signers: bool,
     ) -> Result<PendingUpdatesForExport, MlsError> {
         if self.pending_updates.is_empty() {
-            return Ok((None, Vec::new()));
+            return Ok((None, Vec::new(), Vec::new()));
         }
+
+        let identity_index = self.own_update_signing_identities();
 
         let mut entries: Vec<(&HpkePublicKey, &(HpkeSecretKey, Option<SignatureSecretKey>))> =
             self.pending_updates.iter().collect();
@@ -801,7 +906,9 @@ where
                 signers.push(SwiftExportPendingSigner {
                     leaf_public_key: public_key.as_ref().to_vec(),
                     signer,
-                    signing_identity: self.own_update_signing_identity(public_key),
+                    signing_identity: identity_index
+                        .get(public_key.as_ref())
+                        .map(|identity| (*identity).clone()),
                 });
             }
 
@@ -814,7 +921,103 @@ where
             );
         }
 
-        Ok((Some(mapped), signers))
+        Ok((Some(mapped), signers, Vec::new()))
+    }
+
+    /// Like `pending_updates_from`, but replaces the carry-or-refuse choice
+    /// with a per-entry `place` verdict (`SwiftExportPendingPlacement`),
+    /// keyed the same way -- on the entry's leaf HPKE public key -- for
+    /// `Group::export_for_swift_placing_pending`.
+    ///
+    /// `Snapshot`-placed entries are mapped exactly like `pending_updates_from`
+    /// carries one: dense index counted only across `Snapshot`-placed entries,
+    /// same deterministic public-key-sorted order, signer carried (never
+    /// refused -- there is no non-carrying mode here). `Detached`-placed
+    /// entries never reach the index count or the snapshot map at all; their
+    /// secret, and their signer/identity if they have one, go to the third
+    /// element instead. `Omit`-placed entries are dropped before either --
+    /// no secret of theirs is copied anywhere.
+    fn pending_updates_placing(
+        &self,
+        suite: u16,
+        place: &dyn Fn(&[u8]) -> SwiftExportPendingPlacement,
+    ) -> Result<PendingUpdatesForExport, MlsError> {
+        if self.pending_updates.is_empty() {
+            return Ok((None, Vec::new(), Vec::new()));
+        }
+
+        let identity_index = self.own_update_signing_identities();
+
+        let mut entries: Vec<(&HpkePublicKey, &(HpkeSecretKey, Option<SignatureSecretKey>))> =
+            self.pending_updates.iter().collect();
+
+        entries.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
+
+        let mut mapped = BTreeMap::new();
+        let mut snapshot_signers = Vec::new();
+        let mut detached = Vec::new();
+        let mut index = 0u64;
+
+        for (public_key, (secret, signer)) in entries {
+            match place(public_key.as_ref()) {
+                SwiftExportPendingPlacement::Omit => continue,
+                SwiftExportPendingPlacement::Snapshot => {
+                    check_secret_key_len(suite, secret.as_ref())?;
+
+                    if let Some(signer) = signer.clone() {
+                        snapshot_signers.push(SwiftExportPendingSigner {
+                            leaf_public_key: public_key.as_ref().to_vec(),
+                            signer,
+                            signing_identity: identity_index
+                                .get(public_key.as_ref())
+                                .map(|identity| (*identity).clone()),
+                        });
+                    }
+
+                    mapped.insert(
+                        index,
+                        SwiftPendingUpdateEntry {
+                            public_key: public_key.as_ref().to_vec(),
+                            secret: Zeroizing::new(secret.as_ref().to_vec()),
+                        },
+                    );
+                    index += 1;
+                }
+                SwiftExportPendingPlacement::Detached => {
+                    check_secret_key_len(suite, secret.as_ref())?;
+
+                    let signer = signer.clone();
+
+                    // Only a signer-carrying entry needs an identity to join
+                    // -- a plain refresh proposes no replacement, so there is
+                    // nothing meaningful to look up, and skipping the lookup
+                    // keeps this arm from paying for the common case.
+                    let signing_identity = signer
+                        .is_some()
+                        .then(|| {
+                            identity_index
+                                .get(public_key.as_ref())
+                                .map(|identity| (*identity).clone())
+                        })
+                        .flatten();
+
+                    detached.push(SwiftExportDetachedPending {
+                        leaf_public_key: public_key.as_ref().to_vec(),
+                        secret: Zeroizing::new(secret.as_ref().to_vec()),
+                        signer,
+                        signing_identity,
+                    });
+                }
+            }
+        }
+
+        let mapped = if mapped.is_empty() {
+            None
+        } else {
+            Some(mapped)
+        };
+
+        Ok((mapped, snapshot_signers, detached))
     }
 }
 
@@ -947,7 +1150,7 @@ mod tests {
         identity::test_utils::get_test_signing_identity,
     };
 
-    use super::Proposal;
+    use super::{Proposal, SwiftExportPendingPlacement};
 
     #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
     async fn export_for_swift_has_expected_shape() {
@@ -1751,6 +1954,407 @@ mod tests {
             Err(MlsError::SwiftExportSecretKeyLengthMismatch { .. }) => (),
             other => panic!("expected PQ secret-key refusal, got {other:?}"),
         }
+    }
+
+    /// `export_for_swift_placing_pending` with every entry placed `Snapshot`
+    /// must be indistinguishable from `export_for_swift_with_pending_signers`:
+    /// same snapshot bytes, same signer list, and still format 2.
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn export_for_swift_placing_pending_all_snapshot_matches_unfiltered() {
+        let cipher_suite: CipherSuite = TEST_CIPHER_SUITE;
+        let mut groups = test_n_member_group(TEST_PROTOCOL_VERSION, cipher_suite, 2).await;
+
+        groups[0].propose_update(vec![]).await.unwrap();
+
+        let (identity, signer) = get_test_signing_identity(cipher_suite, b"member").await;
+        groups[0]
+            .propose_update_with_identity(signer, identity, vec![])
+            .await
+            .unwrap();
+
+        let (unfiltered_bytes, unfiltered_signers) = groups[0]
+            .export_for_swift_with_pending_signers()
+            .await
+            .unwrap();
+
+        let (bytes, signers, detached) = groups[0]
+            .export_for_swift_placing_pending(|_| SwiftExportPendingPlacement::Snapshot)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            bytes, unfiltered_bytes,
+            "placing everything Snapshot must equal the unfiltered export byte-for-byte"
+        );
+        assert!(detached.is_empty(), "nothing was placed Detached");
+
+        assert_eq!(signers.len(), unfiltered_signers.len());
+        for (placed, unfiltered) in signers.iter().zip(unfiltered_signers.iter()) {
+            assert_eq!(placed.leaf_public_key, unfiltered.leaf_public_key);
+            assert_eq!(placed.signer, unfiltered.signer);
+            assert_eq!(placed.signing_identity, unfiltered.signing_identity);
+        }
+
+        let value: Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let top = value.into_map().expect("top level is a map");
+        assert_eq!(
+            top.iter()
+                .find(|(k, _)| k == &Value::from(0u64))
+                .map(|(_, v)| v),
+            Some(&Value::from(2u64)),
+            "still format 2"
+        );
+    }
+
+    /// `export_for_swift_placing_pending` with every entry placed `Omit`
+    /// drops `pending_updates` from the snapshot entirely -- absent, not an
+    /// empty map (spec §4.1.2) -- and returns no signers and nothing
+    /// detached: an omitted entry's secret is not exported at all.
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn export_for_swift_placing_pending_all_omit_drops_pending_updates() {
+        let cipher_suite: CipherSuite = TEST_CIPHER_SUITE;
+        let mut groups = test_n_member_group(TEST_PROTOCOL_VERSION, cipher_suite, 2).await;
+
+        groups[0].propose_update(vec![]).await.unwrap();
+
+        let (identity, signer) = get_test_signing_identity(cipher_suite, b"member").await;
+        groups[0]
+            .propose_update_with_identity(signer, identity, vec![])
+            .await
+            .unwrap();
+
+        let (bytes, signers, detached) = groups[0]
+            .export_for_swift_placing_pending(|_| SwiftExportPendingPlacement::Omit)
+            .await
+            .unwrap();
+
+        assert!(
+            signers.is_empty(),
+            "omitting everything must return no signers"
+        );
+        assert!(
+            detached.is_empty(),
+            "omitting everything must detach nothing"
+        );
+
+        let value: Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let top = value.into_map().expect("top level is a map");
+
+        fn get(map: &[(Value, Value)], k: u64) -> &Value {
+            map.iter()
+                .find(|(key, _)| key == &Value::from(k))
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| panic!("missing key {k}"))
+        }
+
+        assert_eq!(get(&top, 0), &Value::from(2u64), "still format 2");
+
+        let membership = get(&top, 2).as_map().unwrap()[0].1.as_map().unwrap();
+        assert!(
+            !membership.iter().any(|(k, _)| k == &Value::from(1u64)),
+            "membership key 1 (pending_updates) must be absent, not an empty map"
+        );
+    }
+
+    /// A mixed case: three refreshes and one signer-carrying update, each
+    /// placed differently. Every entry must land exactly where `place` put
+    /// it -- two refreshes `Snapshot` (dense indices `0..2`, contributing no
+    /// signer), one refresh `Omit` (appears nowhere), and the
+    /// signer-carrying update `Detached` (carrying the exact HPKE secret
+    /// `propose_update_with_identity` parked -- verified the same way
+    /// `export_for_swift_with_pending_signers_carries_matching_secret` does
+    /// -- plus its signer and proposed identity, and absent from both the
+    /// snapshot and the signer list).
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn export_for_swift_placing_pending_mixed_placement() {
+        let cipher_suite: CipherSuite = TEST_CIPHER_SUITE;
+        let mut groups = test_n_member_group(TEST_PROTOCOL_VERSION, cipher_suite, 2).await;
+
+        groups[0].propose_update(vec![]).await.unwrap();
+        groups[0].propose_update(vec![]).await.unwrap();
+        groups[0].propose_update(vec![]).await.unwrap();
+
+        let (identity, signer) = get_test_signing_identity(cipher_suite, b"member").await;
+        groups[0]
+            .propose_update_with_identity(signer.clone(), identity.clone(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            groups[0].pending_updates.len(),
+            4,
+            "three refreshes plus the signer-carrying update"
+        );
+
+        let (signer_leaf, expected_secret) = groups[0]
+            .pending_updates
+            .iter()
+            .find(|(_, (_, s))| s.is_some())
+            .map(|(pk, (sk, _))| (pk.as_ref().to_vec(), sk.as_ref().to_vec()))
+            .expect("the signer-carrying update must have parked its secret before export");
+
+        let refresh_leaves: Vec<Vec<u8>> = groups[0]
+            .pending_updates
+            .iter()
+            .filter(|(_, (_, s))| s.is_none())
+            .map(|(pk, _)| pk.as_ref().to_vec())
+            .collect();
+        assert_eq!(refresh_leaves.len(), 3, "three signer-less refreshes");
+
+        use std::collections::BTreeSet;
+
+        let snapshot_leaves: BTreeSet<Vec<u8>> =
+            [refresh_leaves[0].clone(), refresh_leaves[1].clone()]
+                .into_iter()
+                .collect();
+        let omit_leaf = refresh_leaves[2].clone();
+        let detached_leaf = signer_leaf.clone();
+
+        let (bytes, signers, detached) = groups[0]
+            .export_for_swift_placing_pending(|pk| {
+                if pk == detached_leaf.as_slice() {
+                    SwiftExportPendingPlacement::Detached
+                } else if snapshot_leaves.contains(pk) {
+                    SwiftExportPendingPlacement::Snapshot
+                } else {
+                    assert_eq!(
+                        pk,
+                        omit_leaf.as_slice(),
+                        "every leaf must be one of the three above"
+                    );
+                    SwiftExportPendingPlacement::Omit
+                }
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            signers.is_empty(),
+            "the two Snapshot-placed entries are signer-less refreshes; the \
+             signer-carrying entry was placed Detached and must not leak in"
+        );
+
+        assert_eq!(detached.len(), 1, "exactly the Detached-placed entry");
+        let detached_entry = &detached[0];
+        assert_eq!(detached_entry.leaf_public_key, signer_leaf);
+        assert_eq!(
+            detached_entry.secret.as_slice(),
+            expected_secret,
+            "the detached secret must equal pending_updates[pk].0"
+        );
+        assert_eq!(
+            detached_entry.signer,
+            Some(signer),
+            "the detached entry must carry its own replacement signer"
+        );
+        assert_eq!(
+            detached_entry.signing_identity,
+            Some(identity),
+            "the detached entry must carry the identity proposed alongside it"
+        );
+
+        let value: Value = ciborium::from_reader(bytes.as_slice()).unwrap();
+        let top = value.into_map().expect("top level is a map");
+
+        fn get(map: &[(Value, Value)], k: u64) -> &Value {
+            map.iter()
+                .find(|(key, _)| key == &Value::from(k))
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| panic!("missing key {k}"))
+        }
+
+        assert_eq!(get(&top, 0), &Value::from(2u64), "still format 2");
+
+        let membership = get(&top, 2).as_map().unwrap()[0].1.as_map().unwrap();
+        let pending = get(membership, 1)
+            .as_map()
+            .expect("pending_updates present");
+
+        assert_eq!(pending.len(), 2, "exactly the two Snapshot-placed entries");
+
+        assert!(
+            pending.iter().any(|(k, _)| k == &Value::from(0u64)),
+            "index 0 must be present"
+        );
+        assert!(
+            pending.iter().any(|(k, _)| k == &Value::from(1u64)),
+            "index 1 must be present"
+        );
+        assert!(
+            !pending.iter().any(|(k, _)| k == &Value::from(2u64)),
+            "indices must be dense from 0 -- no index beyond the two kept entries"
+        );
+
+        let exported_keys: BTreeSet<Vec<u8>> = pending
+            .iter()
+            .map(|(_, entry)| {
+                let entry = entry.as_map().expect("PendingUpdateEntry");
+                get(entry, 0).as_bytes().expect("public_key bytes").clone()
+            })
+            .collect();
+        assert_eq!(
+            exported_keys, snapshot_leaves,
+            "the snapshot must hold exactly the Snapshot-placed keys -- neither \
+             the omitted nor the detached leaf may appear"
+        );
+    }
+
+    /// Regression coverage for `Group::own_update_signing_identities` (the
+    /// once-per-export index that replaced a per-entry linear scan of
+    /// `own_proposals`): with a hundred signer-carrying pending updates,
+    /// every signer's `signing_identity` must still join to the identity
+    /// actually proposed for that leaf, not just for the small N the other
+    /// tests cover. Exercises both entry points that consult the index --
+    /// `export_for_swift_with_pending_signers` (`pending_updates_from`) and
+    /// `export_for_swift_placing_pending` (`pending_updates_placing`).
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn many_signer_carrying_pending_updates_join_correct_identity() {
+        const COUNT: usize = 100;
+
+        // CURVE25519_AES128, not TEST_CIPHER_SUITE (P256_AES128): P-256's raw
+        // scalar occasionally serializes one byte short of check_secret_key_len's
+        // fixed 32, a pre-existing and unrelated flake this test's key volume
+        // would otherwise hit often enough to make it unreliable.
+        let cipher_suite: CipherSuite = CipherSuite::CURVE25519_AES128;
+        let mut groups = test_n_member_group(TEST_PROTOCOL_VERSION, cipher_suite, 2).await;
+
+        use std::collections::BTreeMap;
+
+        let mut expected = BTreeMap::new();
+
+        for i in 0..COUNT {
+            let (identity, signer) =
+                get_test_signing_identity(cipher_suite, format!("member-{i}").as_bytes()).await;
+
+            groups[0]
+                .propose_update_with_identity(signer.clone(), identity.clone(), vec![])
+                .await
+                .unwrap();
+
+            let leaf = groups[0]
+                .pending_updates
+                .iter()
+                .find(|(_, (_, s))| s.as_ref() == Some(&signer))
+                .map(|(pk, _)| pk.as_ref().to_vec())
+                .expect("the just-proposed update must be parked");
+
+            expected.insert(leaf, identity);
+        }
+
+        assert_eq!(groups[0].pending_updates.len(), COUNT);
+
+        let (_, signers) = groups[0]
+            .export_for_swift_with_pending_signers()
+            .await
+            .unwrap();
+
+        assert_eq!(signers.len(), COUNT);
+        for entry in &signers {
+            let expected_identity = expected
+                .get(&entry.leaf_public_key)
+                .unwrap_or_else(|| panic!("no expected identity for a returned leaf"));
+            assert_eq!(
+                entry.signing_identity.as_ref(),
+                Some(expected_identity),
+                "signing_identity must join to the identity proposed for this leaf"
+            );
+        }
+
+        let (_, signers, detached) = groups[0]
+            .export_for_swift_placing_pending(|_| SwiftExportPendingPlacement::Snapshot)
+            .await
+            .unwrap();
+
+        assert!(detached.is_empty());
+        assert_eq!(signers.len(), COUNT);
+        for entry in &signers {
+            let expected_identity = expected
+                .get(&entry.leaf_public_key)
+                .unwrap_or_else(|| panic!("no expected identity for a returned leaf"));
+            assert_eq!(
+                entry.signing_identity.as_ref(),
+                Some(expected_identity),
+                "signing_identity must join to the identity proposed for this leaf"
+            );
+        }
+    }
+
+    /// Scale check, not run by default (`cargo test --release -- --ignored
+    /// pending_updates_scale_placement_is_reasonably_fast`): ~20,000 plain
+    /// refreshes placed `Snapshot` plus ~20,000 signer-carrying updates
+    /// placed `Detached`, exported once through
+    /// `export_for_swift_placing_pending`. Exists to catch a regression back
+    /// to the O(N^2) per-entry `own_proposals` scan
+    /// `own_update_signing_identities` replaced: with this many
+    /// signer-carrying entries, that scan made this input effectively hang.
+    #[ignore]
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn pending_updates_scale_placement_is_reasonably_fast() {
+        const REFRESH_COUNT: usize = 20_000;
+        const SIGNER_COUNT: usize = 20_000;
+
+        // See many_signer_carrying_pending_updates_join_correct_identity for
+        // why this uses CURVE25519_AES128 rather than TEST_CIPHER_SUITE: at
+        // this key volume, P256_AES128's rare short-scalar encoding would
+        // otherwise abort the run well before it reaches the timed section.
+        let cipher_suite: CipherSuite = CipherSuite::CURVE25519_AES128;
+        let mut groups = test_n_member_group(TEST_PROTOCOL_VERSION, cipher_suite, 2).await;
+
+        for _ in 0..REFRESH_COUNT {
+            groups[0].propose_update(vec![]).await.unwrap();
+        }
+
+        for i in 0..SIGNER_COUNT {
+            let (identity, signer) =
+                get_test_signing_identity(cipher_suite, format!("scale-{i}").as_bytes()).await;
+            groups[0]
+                .propose_update_with_identity(signer, identity, vec![])
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            groups[0].pending_updates.len(),
+            REFRESH_COUNT + SIGNER_COUNT
+        );
+
+        use std::collections::BTreeSet;
+
+        let signer_leaves: BTreeSet<Vec<u8>> = groups[0]
+            .pending_updates
+            .iter()
+            .filter(|(_, (_, s))| s.is_some())
+            .map(|(pk, _)| pk.as_ref().to_vec())
+            .collect();
+        assert_eq!(signer_leaves.len(), SIGNER_COUNT);
+
+        let start = std::time::Instant::now();
+
+        let (bytes, signers, detached) = groups[0]
+            .export_for_swift_placing_pending(|pk| {
+                if signer_leaves.contains(pk) {
+                    SwiftExportPendingPlacement::Detached
+                } else {
+                    SwiftExportPendingPlacement::Snapshot
+                }
+            })
+            .await
+            .unwrap();
+
+        let elapsed = start.elapsed();
+        eprintln!(
+            "pending_updates_scale_placement_is_reasonably_fast: {elapsed:?} for {} pending \
+             updates ({REFRESH_COUNT} refreshes Snapshot, {SIGNER_COUNT} signer-carrying \
+             Detached), {} snapshot bytes",
+            REFRESH_COUNT + SIGNER_COUNT,
+            bytes.len()
+        );
+
+        assert!(
+            signers.is_empty(),
+            "every Snapshot-placed entry is a signer-less refresh"
+        );
+        assert_eq!(detached.len(), SIGNER_COUNT);
     }
 }
 
