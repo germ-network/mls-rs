@@ -2356,6 +2356,39 @@ mod tests {
         );
         assert_eq!(detached.len(), SIGNER_COUNT);
     }
+
+    /// `UpdateProposal::hpke_public_key` is the key a pending entry is placed
+    /// by, so an own-proposal entry joins to its detached secret through it.
+    #[maybe_async::test(not(mls_build_async), async(mls_build_async, crate::futures_test))]
+    async fn own_update_hpke_public_key_joins_its_detached_pending_entry() {
+        let cipher_suite = CipherSuite::CURVE25519_AES128;
+        let mut groups = test_n_member_group(TEST_PROTOCOL_VERSION, cipher_suite, 2).await;
+
+        groups[0].propose_update(vec![]).await.unwrap();
+
+        let own = groups[0].own_proposals_for_swift_export().unwrap();
+        assert_eq!(own.len(), 1);
+        let Proposal::Update(update) =
+            Proposal::mls_decode(&mut own[0].proposal.as_slice()).expect("own proposal decodes")
+        else {
+            panic!("expected an Update proposal");
+        };
+        let leaf_key = update.hpke_public_key().as_ref().to_vec();
+
+        let (_, _, detached) = groups[0]
+            .export_for_swift_placing_pending(|pk| {
+                if pk == leaf_key.as_slice() {
+                    SwiftExportPendingPlacement::Detached
+                } else {
+                    SwiftExportPendingPlacement::Omit
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(detached.len(), 1);
+        assert_eq!(detached[0].leaf_public_key, leaf_key);
+    }
 }
 
 /// Test-only helpers for the mutation checks.
