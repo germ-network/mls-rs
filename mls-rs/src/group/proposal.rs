@@ -102,6 +102,14 @@ impl UpdateProposal {
         &self.leaf_node.signing_identity
     }
 
+    /// The proposed leaf's HPKE public key — the same bytes a `pending_updates` entry
+    /// (and so `SwiftExportDetachedPending::leaf_public_key`) is keyed on, for a caller
+    /// joining an own-proposal-cache entry to its `export_for_swift_placing_pending`
+    /// placement or detached secret.
+    pub fn hpke_public_key(&self) -> &crate::crypto::HpkePublicKey {
+        &self.leaf_node.public_key
+    }
+
     /// New Client [`Capabilities`] of the [`Member`](mls_rs_core::group::Member)
     /// that will be updated by this proposal.
     pub fn capabilities(&self) -> Capabilities {
