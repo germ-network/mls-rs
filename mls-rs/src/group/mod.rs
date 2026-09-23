@@ -139,6 +139,8 @@ pub(crate) mod state;
 
 #[cfg(feature = "swift_export")]
 pub(crate) mod swift_export;
+#[cfg(feature = "swift_export")]
+pub use self::swift_export::{SwiftExportOwnProposal, SwiftExportPendingSigner};
 
 #[cfg(feature = "prior_epoch")]
 pub(crate) mod state_repo;

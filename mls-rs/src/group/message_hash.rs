@@ -34,4 +34,11 @@ impl MessageHash {
             .map_err(|e| MlsError::CryptoProviderError(e.into_any_error()))
             .map(Self)
     }
+
+    /// The raw `CipherSuite.Hash` digest bytes -- not the MLS-encoded form
+    /// (`MlsEncode` on this type adds a length-prefix header, which callers
+    /// that want to reproduce `compute`'s output byte-for-byte do not want).
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
