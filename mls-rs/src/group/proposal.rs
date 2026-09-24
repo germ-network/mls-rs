@@ -24,6 +24,9 @@ pub use mls_rs_core::group::ProposalType;
 #[cfg(feature = "psk")]
 use crate::psk::{ExternalPskId, JustPreSharedKeyID, PreSharedKeyID};
 
+#[cfg(feature = "safe_extensions")]
+use crate::psk::ApplicationPsk;
+
 #[derive(Clone, Debug, PartialEq, MlsSize, MlsEncode, MlsDecode)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -99,6 +102,14 @@ impl UpdateProposal {
         &self.leaf_node.signing_identity
     }
 
+    /// The proposed leaf's HPKE public key — the same bytes a `pending_updates` entry
+    /// (and so `SwiftExportDetachedPending::leaf_public_key`) is keyed on, for a caller
+    /// joining an own-proposal-cache entry to its `export_for_swift_placing_pending`
+    /// placement or detached secret.
+    pub fn hpke_public_key(&self) -> &crate::crypto::HpkePublicKey {
+        &self.leaf_node.public_key
+    }
+
     /// New Client [`Capabilities`] of the [`Member`](mls_rs_core::group::Member)
     /// that will be updated by this proposal.
     pub fn capabilities(&self) -> Capabilities {
@@ -166,6 +177,26 @@ impl PreSharedKeyProposal {
         match self.psk.key_id {
             JustPreSharedKeyID::External(ref ext) => Some(ext),
             JustPreSharedKeyID::Resumption(_) => None,
+            #[cfg(feature = "safe_extensions")]
+            JustPreSharedKeyID::Application(_) => None,
+        }
+    }
+
+    /// The application pre-shared key id of this proposal
+    /// (`psk_type = application(3)` from draft-ietf-mls-extensions-08).
+    ///
+    /// Together with [`PreSharedKeyProposal::external_psk_id`] this allows
+    /// [`MlsRules`](crate::MlsRules) implementations to classify a pre-shared
+    /// key proposal: a proposal for which both accessors return `None` is a
+    /// resumption PSK.
+    ///
+    /// Returns `None` in the condition that the underlying psk is not an
+    /// application psk.
+    #[cfg(feature = "safe_extensions")]
+    pub fn application_psk(&self) -> Option<&ApplicationPsk> {
+        match self.psk.key_id {
+            JustPreSharedKeyID::Application(ref app) => Some(app),
+            JustPreSharedKeyID::External(_) | JustPreSharedKeyID::Resumption(_) => None,
         }
     }
 }

@@ -12,17 +12,22 @@ fn main() {
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod swift {
     use serde::Deserialize;
-    use std::{env, process::Command};
+    use std::{
+        env,
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     /// Needed because of the min system reqs for HPKE in CryptoKit.
     /// See https://developer.apple.com/documentation/cryptokit/hpke
     const MIN_IOS_DEPLOYMENT_TARGET: &str = "17.0";
-    const MIN_OSX_DEPLOYMENT_TARGET: &str = "26.0";
+    // macOS ships the Swift runtime in the OS, so any modern deployment target does NOT
+    // require an rpath. "26.0" tripped `libraries_require_rpath` (and the panic in
+    // configure()) on the macOS 26 SDK — even for the host bindgen build. 15.0 is safe.
+    const MIN_OSX_DEPLOYMENT_TARGET: &str = "15.0";
 
     #[derive(Debug, Deserialize)]
     struct SwiftTargetInfo {
-        #[serde(rename = "unversionedTriple")]
-        pub unversioned_triple: String,
         #[serde(rename = "librariesRequireRPath")]
         pub libraries_require_rpath: bool,
     }
@@ -71,8 +76,17 @@ mod swift {
 
     pub fn configure() {
         let swift_target_info = get_target_info();
+        // NOTE: some toolchains (e.g. the macOS 26 / Xcode 26 betas) report
+        // `librariesRequireRPath = true` for *every* Apple target, including iOS. The
+        // original code panicked in that case. That guard is spurious for our use: the
+        // cdylib is shipped inside an `@rpath/…framework` (see TwoMLSPQ buildIosDynamic.sh),
+        // so rpath-based loading is exactly what we want. We still emit the Swift runtime
+        // link-search paths below, which is all the build actually needs.
         if swift_target_info.target.libraries_require_rpath {
-            panic!("Libraries require RPath! Change minimum MacOS value to fix.")
+            println!(
+                "cargo:warning=swift target reports librariesRequireRPath; \
+                 shipping as an @rpath framework, continuing."
+            );
         }
 
         swift_target_info
@@ -122,11 +136,52 @@ mod swift {
         }
 
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-        let swift_target_info = get_target_info();
-        println!(
-            "cargo:rustc-link-search=native={}/{}.build/{}/{}",
-            manifest_dir, package_root, swift_target_info.target.unversioned_triple, profile
-        );
+        let build_dir = format!("{manifest_dir}/{package_root}.build");
+
+        // SwiftPM's output layout differs across toolchains: older `swift build`
+        // emitted `.build/<unversioned-triple>/<profile>/`, while the Xcode 26 /
+        // Swift 6.x build engine emits `.build/out/Products/<Config>/` (with a
+        // `.build/<profile>` convenience symlink). Rather than hard-code either,
+        // locate the archive `swift build` just produced and link against its dir.
+        let lib_file = format!("lib{package_name}.a");
+        let lib_dir = newest_lib_dir(Path::new(&build_dir), &lib_file).unwrap_or_else(|| {
+            panic!("Could not find {lib_file} under {build_dir} after building {package_name}")
+        });
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
         println!("cargo:rustc-link-lib=static={package_name}");
+    }
+
+    /// Recursively find the most recently modified `lib_file` under `root` and
+    /// return the directory containing it. Symlinked directories are skipped so
+    /// the same archive isn't discovered twice (the build engine symlinks
+    /// `.build/<profile>` at the real product directory).
+    fn newest_lib_dir(root: &Path, lib_file: &str) -> Option<PathBuf> {
+        let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    if !path.is_symlink() {
+                        stack.push(path);
+                    }
+                } else if entry.file_name() == std::ffi::OsStr::new(lib_file) {
+                    let mtime = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::UNIX_EPOCH);
+                    if best.as_ref().is_none_or(|(t, _)| mtime >= *t) {
+                        best = Some((mtime, dir.clone()));
+                    }
+                }
+            }
+        }
+        best.map(|(_, dir)| dir)
     }
 }

@@ -359,6 +359,84 @@ pub enum MlsError {
     DefaultValueListed,
     #[cfg_attr(feature = "std", error("not a subgroup"))]
     NotASubgroup,
+    #[cfg_attr(
+        feature = "std",
+        error("Component id out of range of the exporter tree (must be less than 2^16)")
+    )]
+    InvalidComponentId,
+    #[cfg_attr(
+        feature = "std",
+        error("Exported secret for this component was already consumed in this epoch")
+    )]
+    ComponentSecretConsumed,
+    #[cfg_attr(
+        feature = "std",
+        error("Attachment object id must be between 1 and 255 bytes")
+    )]
+    InvalidObjectId,
+    /// PROTOTYPE (swift-mls export, spec §6.3 "B3"): a pending commit awaiting
+    /// confirmation has no representation in the swift-mls snapshot format, so
+    /// export is refused rather than silently dropping it.
+    #[cfg(feature = "swift_export")]
+    #[cfg_attr(
+        feature = "std",
+        error("group has a pending commit; swift export is not representable until it is applied or cleared")
+    )]
+    SwiftExportPendingCommitUnsupported,
+    /// A pending self-Update also rotates the signing identity, and the
+    /// snapshot format has no field for the replacement signer (spec/snapshot.md
+    /// §2 excludes signature private keys). Exporting would hand the restored
+    /// session a leaf it cannot sign for, so it is refused rather than
+    /// silently dropping the signer.
+    #[cfg(feature = "swift_export")]
+    #[cfg_attr(
+        feature = "std",
+        error("pending self-update rotates the signing identity, which the swift-mls snapshot cannot carry")
+    )]
+    SwiftExportPendingUpdateSignerUnsupported,
+    /// swift-mls can only restore suites it implements (the classical RFC 9420
+    /// suites and the deployed ML-KEM-768 suite); exporting any other suite
+    /// would produce an archive no consumer can open.
+    #[cfg(feature = "swift_export")]
+    #[cfg_attr(
+        feature = "std",
+        error("cipher suite is not supported by the swift-mls snapshot format")
+    )]
+    SwiftExportCipherSuiteUnsupported,
+    /// A KEM secret key's byte length does not match what the suite requires
+    /// the snapshot to carry (spec/snapshot.md §3.1, Nsk). For ML-KEM-768 this
+    /// is the provider-form check: the snapshot carries raw key bytes, and
+    /// CryptoKit's 96-byte integrityCheckedRepresentation is NOT interchangeable
+    /// with AWS-LC's 2400-byte FIPS 203 expanded key — a wrong-form key would
+    /// decode cleanly on the swift side and fail only at first decapsulation,
+    /// so it is refused here instead.
+    #[cfg(feature = "swift_export")]
+    #[cfg_attr(
+        feature = "std",
+        error("KEM secret key length is not what the swift-mls snapshot format requires for this suite (expected {expected}, got {actual})")
+    )]
+    SwiftExportSecretKeyLengthMismatch { expected: usize, actual: usize },
+    /// The exporting member's own per-client state is not representable: a
+    /// member always holds at least its own leaf's secret key
+    /// (spec/snapshot.md §4.1.2 "Never empty").
+    #[cfg(feature = "swift_export")]
+    #[cfg_attr(
+        feature = "std",
+        error("membership state is not representable in the swift-mls snapshot format")
+    )]
+    SwiftExportMembershipStateInvalid,
+    /// The exporter tree's persisted state violated the snapshot format's
+    /// invariants (a ratchet where only frontier secrets are valid, or a leaf
+    /// count other than 2^16).
+    #[cfg(feature = "swift_export")]
+    #[cfg_attr(
+        feature = "std",
+        error("exporter tree state is not representable in the swift-mls snapshot format")
+    )]
+    SwiftExportExporterTreeInvalid,
+    #[cfg(feature = "swift_export")]
+    #[cfg_attr(feature = "std", error("failed to encode swift-mls export as CBOR"))]
+    SwiftExportEncodingFailed,
 }
 
 impl IntoAnyError for MlsError {
