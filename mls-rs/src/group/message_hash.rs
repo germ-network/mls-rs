@@ -38,6 +38,7 @@ impl MessageHash {
     /// The raw `CipherSuite.Hash` digest bytes -- not the MLS-encoded form
     /// (`MlsEncode` on this type adds a length-prefix header, which callers
     /// that want to reproduce `compute`'s output byte-for-byte do not want).
+    #[cfg(feature = "swift_export")]
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.0
     }
