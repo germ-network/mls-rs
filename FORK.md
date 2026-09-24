@@ -32,18 +32,26 @@ Applied in this order:
 | `fix/cryptokit-build-rpath` | — | 1 | Stops the cryptokit build panicking when a toolchain reports `librariesRequireRPath` (Xcode 26), and lowers `MIN_OSX_DEPLOYMENT_TARGET` to 15.0. Previously carried only on `germ-shadow-safe-exporter`, outside any feature branch. |
 | `feat/safe-extensions-exporter` | [#4](https://github.com/germ-network/mls-rs/pull/4) | 4 | draft-ietf-mls-extensions-08 Safe Extensions: the exporter tree behind `Group::safe_export_secret`, and `psk_type = application(3)`. Feature-gated on `safe_extensions`. |
 | `feat/attachment-cek` | supersedes [#3](https://github.com/germ-network/mls-rs/pull/3) | 2 | draft-sullivan-mls-attachments content encryption keys, layered on the exporter tree. Stacked on `feat/safe-extensions-exporter`. |
-| `ci/fork-ci` | [#8](https://github.com/germ-network/mls-rs/pull/8) | 1 | `.github/workflows/germ-ci.yml`, the fork's own credential-free CI. Applied last; touches nothing the other branches do. |
+| `ci/fork-ci` | [#8](https://github.com/germ-network/mls-rs/pull/8) | 1 | `.github/workflows/germ-ci.yml`, the fork's own credential-free CI. Touches nothing the other branches do. |
+| `llm/export-for-swift-format2` | [#12](https://github.com/germ-network/mls-rs/pull/12) | 6 | `Group::export_for_swift()`: a live group as a swift-mls format-2 snapshot (PQ half, exporter-tree frontier, pending updates), with its end-to-end fixture. Feature-gated on `swift_export`. |
+| `llm/export-for-swift-signer` | [#13](https://github.com/germ-network/mls-rs/pull/13) | 1 | `Group::signer_for_swift_export()`. Stacked on `llm/export-for-swift-format2`. |
+| `llm/export-for-swift-pending` | [#14](https://github.com/germ-network/mls-rs/pull/14) | 4 | Pending-update signers, own proposals, per-entry pending-update placement (`export_for_swift_placing_pending`) and `UpdateProposal::hpke_public_key`, for a migrator. Stacked on `llm/export-for-swift-signer`. |
 
 Where a merged PR's head branch has been deleted or left at an old base, the maintained
 branch listed above supersedes it. Delete a feature branch only once its content is
 either merged upstream or folded into another maintained branch — otherwise the audit
 below loses its reference point, which is how `fix/cryptokit-build-rpath` went missing.
 
-`feat/attachment-cek` is the only stacked branch — it needs the exporter tree, so it
-carries `feat/safe-extensions-exporter`'s four commits rebased onto `main` beneath its
-own two. PR #3 targeted `main` with a parallel implementation that duplicated the
-exporter tree and added a second field to `EpochSecrets`; `feat/attachment-cek` replaces
+`feat/attachment-cek` is stacked: it needs the exporter tree, so it carries
+`feat/safe-extensions-exporter`'s four commits rebased onto `main` beneath its own two. PR #3 targeted `main` with a parallel implementation that
+duplicated the exporter tree and added a second field to `EpochSecrets`; `feat/attachment-cek` replaces
 it with a version that reuses the tree and adds no persisted state.
+
+The swift-export branches are stacked too: `llm/export-for-swift-signer` on
+`llm/export-for-swift-format2`, and `llm/export-for-swift-pending` on the signer branch.
+`llm/export-for-swift-format2` was cut from the composed history rather than from its
+parent branches, so it carries those composed commits beneath its own six; the recipe
+takes only its own commits, by patch id.
 
 ## No pull request in this fork is ever merged
 
@@ -88,16 +96,26 @@ do
   git cherry-pick $(git rev-list --reverse --no-merges $range)
 done
 
+# The swift-export stack. #12's branch carries the composed commits beneath its own,
+# so take only the commits whose patches are not already applied.
+git cherry-pick $(git rev-list --reverse --no-merges --cherry-pick --right-only \
+  HEAD...origin/llm/export-for-swift-format2)
+git cherry-pick $(git rev-list --reverse --no-merges \
+  origin/llm/export-for-swift-format2..origin/llm/export-for-swift-signer)
+git cherry-pick $(git rev-list --reverse --no-merges \
+  origin/llm/export-for-swift-signer..origin/llm/export-for-swift-pending)
+
 git cherry-pick <the FORK.md documentation commit>
 ```
 
 Order matters and matches the feature-branch table above: crypto providers, then the
-build fix, then the exporter tree, then attachments on top of it, then CI. The fourth
+build fix, then the exporter tree, then attachments on top of it, then CI, then the
+swift-export stack. The fourth
 range is `feat/safe-extensions-exporter..feat/attachment-cek` rather than `main..`,
 because #7 is stacked on #4 and carries its commits — taking `main..` would apply them
-twice.
+twice. The swift-export ranges are shaped the same way, for the same reason.
 
-Reconstruction is deterministic: rebuilding from these five ranges reproduces the
+Reconstruction is deterministic: rebuilding from these ranges reproduces the
 previous `germ-integration` tree hash exactly. That is worth re-checking after a rebuild:
 
 ```bash
@@ -158,8 +176,6 @@ TwoMLSPQ wraps `mls-rs` directly with its own uniffi layer (`rust/two-mls-pq`) a
 **not** depend on the `mls-rs-uniffi` crate in this repo, so changes there reach nobody.
 Leave it alone unless that changes.
 
-<<<<<<< Updated upstream
-=======
 ## CI
 
 Until recently no commit in this fork — including the shipped release pin — had
@@ -208,7 +224,6 @@ Three things that are easy to get wrong here:
   being pushed, and adding one moves the pin. `workflow_dispatch` takes a `ref`
   input instead, so the suite can be pointed at a frozen pin on demand.
 
->>>>>>> Stashed changes
 ## Persisted-state fixtures
 
 Cargo features in this crate can change the serialized group-state format: fields on
